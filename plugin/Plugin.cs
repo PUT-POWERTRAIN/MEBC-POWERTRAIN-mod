@@ -16,17 +16,20 @@ namespace BoatMod
     {
         public const string PluginGuid = "mateusz.energyboatsimulator.custommodel";
         public const string PluginName = "BoatModelSwap";
-        public const string PluginVersion = "1.1.0";
+        public const string PluginVersion = "1.3.0";
 
         internal static ManualLogSource Log;
         internal static BoatModPlugin Instance;
+        internal static List<MeshGroup> StaticGroups;
 
         private ConfigEntry<bool> _enabled;
         private ConfigEntry<bool> _hideOriginal;
-        private ConfigEntry<bool> _autoFit;
-        private ConfigEntry<float> _scale;
-        private ConfigEntry<float> _offsetX, _offsetY, _offsetZ;
-        private ConfigEntry<float> _rotY;
+        private ConfigEntry<bool> _postSwap;
+        internal ConfigEntry<bool> Diag;
+        internal ConfigEntry<bool> _autoFit;
+        internal ConfigEntry<float> _scale;
+        internal ConfigEntry<float> _offsetX, _offsetY, _offsetZ;
+        internal ConfigEntry<float> _rotY;
         private ConfigEntry<string> _modelPath;
 
         private List<MeshGroup> _groups;
@@ -44,6 +47,8 @@ namespace BoatMod
 
             _enabled = Config.Bind("General", "Enabled", true, "Master switch");
             _hideOriginal = Config.Bind("General", "HideOriginal", true, "Hide the original boat meshes");
+            _postSwap = Config.Bind("General", "PostSwapFallback", false, "Post-hoc mesh swap in races (native Visual is used instead)");
+            Diag = Config.Bind("General", "Diagnostics", false, "Verbose builder dumps in the log");
             _autoFit = Config.Bind("Model", "AutoFit", true, "Auto-scale model to original boat footprint");
             _scale = Config.Bind("Model", "Scale", 1f, "Extra scale multiplier on top of AutoFit");
             _offsetX = Config.Bind("Model", "OffsetX", 0f, "Local position offset X (meters)");
@@ -69,19 +74,40 @@ namespace BoatMod
                 Log.LogError("[BoatMod] model loaded but contained no geometry");
                 return;
             }
+            StaticGroups = _groups;
+            Log.LogInfo($"[BoatMod] awake on instance id {GetInstanceID()}");
 
             try
             {
+                _harmony = new Harmony(PluginGuid);
                 PatchGameMethods();
-                UnityEngine.SceneManagement.SceneManager.sceneLoaded += (_, __) =>
+                HullIntegration.PatchSelectHull(_harmony);
+                HullIntegration.EnsureIntegrated();
+                HullIntegration.EnsureShopItem();
+                HullIntegration.InstallVisual();
+                UnityEngine.SceneManagement.SceneManager.sceneLoaded += (scene, __) =>
                 {
+                    try { Log.LogInfo($"[BoatMod] scene loaded: '{scene.name}', rescanning"); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] scene log failed: {e}"); return; }
+                    try { HullIntegration.EnsureIntegrated(); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] integrate failed: {e}"); }
+                    try { HullIntegration.EnsureShopItem(); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] shop item failed: {e}"); }
+                    try { HullIntegration.InstallVisual(); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] visual install outer failed: {e}"); }
+                    try { PatchGameMethods(); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] patch failed: {e}"); }
                     try
                     {
-                        Log.LogInfo("[BoatMod] scene loaded, rescanning");
-                        PatchGameMethods();
-                        Scan();
+                        var sln = scene.name.ToLowerInvariant();
+                        if (Instance.Diag.Value && (sln.Contains("builder") || sln.Contains("shop") || sln.Contains("garage") || sln.Contains("menu") || sln.Contains("lobby")))
+                            HullIntegration.DumpBuilder(scene);
                     }
-                    catch (Exception e) { Log.LogError($"[BoatMod] scene hook failed: {e.Message}"); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] builder dump failed: {e}"); }
+                    try { Scan(); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] scan failed: {e}"); }
+                    try { HullIntegration.DumpBoatRenderers(); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] renderer dump failed: {e}"); }
                 };
                 Log.LogInfo("[BoatMod] game hooks installed");
             }
@@ -103,7 +129,8 @@ namespace BoatMod
             if (_methodsPatched) return;
             _harmony ??= new Harmony(PluginGuid);
             int hooked = 0;
-            foreach (var typeName in new[] { "BoatController", "BoatInputActionsHandler", "BoatInputHandler", "PlayerSynchronizer", "GameManager" })
+            foreach (var typeName in new[] { "BoatController", "BoatInputActionsHandler", "BoatInputHandler", "PlayerSynchronizer", "GameManager",
+                "ShopPreview", "ShopBoatBuilder", "ShopManager", "ShopMenuController", "ShopCameraController", "ShopInventory" })
             {
                 var t = FindType(typeName);
                 if (t == null) continue;
@@ -142,6 +169,7 @@ namespace BoatMod
             {
                 Log?.LogInfo("[BoatMod] boat lifecycle method intercepted");
                 Instance?.TrySwap(__instance as Component, true);
+                HullIntegration.DumpBoatRenderers();
             }
             catch { }
         }
@@ -176,15 +204,216 @@ namespace BoatMod
             var root = comp.transform.root.gameObject;
             if (root.GetComponent<BoatModMarker>() != null) return;
             if (requireMine && !IsMine(root)) return;
+            if (!HullIntegration.IsOurHull(root))
+            {
+                if (_skipLogged.Add(root.GetInstanceID()))
+                    Log.LogInfo($"[BoatMod] skipping '{root.name}', not our hull");
+                return;
+            }
+            if (!_postSwap.Value)
+            {
+                if (_nativeLogged.Add(root.GetInstanceID()))
+                    Log.LogInfo($"[BoatMod] native-visual mode, no post-swap on '{root.name}'");
+                return;
+            }
+            if (!HullIntegration.LastDecisionByRef &&
+                _compLogged.Add(root.GetInstanceID()))
+            {
+                var parts = new List<string>();
+                foreach (var c in root.GetComponents<Component>())
+                    if (c != null) parts.Add(c.GetType().Name);
+                Log.LogInfo($"[BoatMod] race boat '{root.name}' comps: [{string.Join(", ", parts)}]");
+            }
             try
             {
-                ApplySwap(root);
+                ApplySwap(root, null);
             }
             catch (Exception e)
             {
                 Log.LogError($"[BoatMod] swap failed on '{root.name}': {e}");
                 root.AddComponent<BoatModMarker>();
             }
+        }
+
+        private readonly HashSet<int> _skipLogged = new HashSet<int>();
+        private readonly HashSet<int> _nativeLogged = new HashSet<int>();
+        private readonly HashSet<int> _compLogged = new HashSet<int>();
+        private readonly HashSet<int> _dictLogged = new HashSet<int>();
+        private int _lastPreviewSel = -999;
+        private string _previewEmptyScene;
+        private int _previewLogCounter;
+        private readonly Dictionary<int, List<Renderer>> _hiddenByPreview = new Dictionary<int, List<Renderer>>();
+
+        internal void HandleBuilderPreview()
+        {
+            if (_groups == null || !_enabled.Value) return;
+            var pvType = FindType("ShopPreview") ?? FindType("BoatPreview");
+            if (pvType == null) { Log.LogInfo("[BoatMod] preview: no preview type found"); return; }
+            var previews = new List<Component>();
+            foreach (var o in FindObjectsOfType(pvType))
+                if (o is Component c && c != null) previews.Add(c);
+            if (previews.Count == 0)
+            {
+                try
+                {
+                    foreach (var o in Resources.FindObjectsOfTypeAll(pvType))
+                        if (o is Component c && c != null && c.gameObject.scene.IsValid() && c.gameObject.activeInHierarchy)
+                            previews.Add(c);
+                }
+                catch { }
+            }
+            if (previews.Count == 0)
+            {
+                var scn = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+                if (_previewEmptyScene != scn)
+                {
+                    _previewEmptyScene = scn;
+                    Log.LogInfo("[BoatMod] preview: no preview instances");
+                }
+                return;
+            }
+            int sel = HullIntegration.SelectedIndex;
+            if (sel < 0) sel = HullIntegration.ReadSelectedIndexFallback();
+            if (sel < 0) sel = ReadPreviewHullSelection();
+            int ours = HullIntegration.OurItemIndex >= 0 ? HullIntegration.OurItemIndex : HullIntegration.OurIndex;
+            _previewLogCounter++;
+            if (sel != _lastPreviewSel || _previewLogCounter % 20 == 0)
+            {
+                _lastPreviewSel = sel;
+                Log.LogInfo($"[BoatMod] preview: sel={sel} ours={ours} instances={previews.Count}");
+            }
+            foreach (var comp in previews)
+            {
+                if (comp == null) continue;
+                var go = comp.gameObject;
+                if (sel == ours && ours >= 0)
+                {
+                    var marker = go.GetComponent<BoatModMarker>();
+                    bool hasModel = go.transform.Find("BoatMod_CustomModel") != null;
+                    if (marker != null && hasModel) continue;
+                    if (marker != null) Destroy(marker);
+                    try
+                    {
+                        var rec = new List<Renderer>();
+                        ApplySwap(go, rec);
+                        _hiddenByPreview[go.GetInstanceID()] = rec;
+                    }
+                    catch (Exception e)
+                    {
+                        Log.LogError($"[BoatMod] preview swap failed: {e.Message}");
+                    }
+                }
+                else
+                {
+                    RestorePreview(go);
+                }
+            }
+        }
+
+        private int ReadPreviewHullSelection()
+        {
+            try
+            {
+                var previewType = FindType("ShopPreview");
+                if (previewType != null)
+                {
+                    foreach (var obj in FindObjectsOfType(previewType))
+                    {
+                        var comp = obj as Component;
+                        if (comp == null) continue;
+                        object dict = null;
+                        try
+                        {
+                            var prop = previewType.GetProperty("SelectedItems", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                            if (prop != null) dict = prop.GetValue(comp);
+                        }
+                        catch { }
+                        if (dict == null)
+                        {
+                            foreach (var f in previewType.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                            {
+                                try
+                                {
+                                    if (typeof(System.Collections.IDictionary).IsAssignableFrom(f.FieldType))
+                                    { dict = f.GetValue(comp); break; }
+                                }
+                                catch { }
+                            }
+                        }
+                        if (dict is System.Collections.IDictionary d)
+                        {
+                            if (_dictLogged.Add(comp.GetInstanceID()))
+                            {
+                                var dp = new List<string>();
+                                foreach (var k in d.Keys) dp.Add(k == null ? "null" : k.ToString());
+                                Log.LogInfo($"[BoatMod] SelectedItems keys: [{string.Join(", ", dp)}] count={d.Count}");
+                                foreach (var v in d.Values)
+                                    Log.LogInfo($"[BoatMod] SelectedItems value: {(v == null ? "null" : v.GetType().Name + " '" + (v as UnityEngine.Object)?.name + "'")}");
+                            }
+                            foreach (var v in d.Values)
+                            {
+                                if (v == null || v.GetType().Name != "HullShopItem") continue;
+                                if (HullIntegration.OurItem != null && ReferenceEquals(v, HullIntegration.OurItem))
+                                    return HullIntegration.OurItemIndex >= 0 ? HullIntegration.OurItemIndex : HullIntegration.OurIndex;
+                                return -2;
+                            }
+                        }
+                    }
+                }
+                var builderType = FindType("ShopBoatBuilder");
+                if (builderType == null) return -1;
+                foreach (var obj in FindObjectsOfType(builderType))
+                {
+                    var comp = obj as Component;
+                    if (comp == null) continue;
+                    foreach (var f in builderType.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                    {
+                        object item = null;
+                        try
+                        {
+                            if (f.FieldType.Name == "HullShopItem") item = f.GetValue(comp);
+                            else continue;
+                        }
+                        catch { continue; }
+                        if (item == null) continue;
+                        foreach (var hf in item.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                        {
+                            try
+                            {
+                                if (hf.FieldType.Name != "HullPropertiesSO") continue;
+                                var hull = hf.GetValue(item) as UnityEngine.Object;
+                                if (hull == null) continue;
+                                if (HullIntegration.OurHull != null && ReferenceEquals(hull, HullIntegration.OurHull))
+                                    return HullIntegration.OurIndex;
+                                return -2;
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return -1;
+        }
+
+        private void RestorePreview(GameObject go)
+        {
+            try
+            {
+                var id = go.GetInstanceID();
+                foreach (Transform child in go.transform)
+                    if (child.name == "BoatMod_CustomModel")
+                        Destroy(child.gameObject);
+                if (_hiddenByPreview.TryGetValue(id, out var hidden))
+                {
+                    foreach (var r in hidden)
+                        if (r != null) r.enabled = true;
+                    _hiddenByPreview.Remove(id);
+                }
+                var marker = go.GetComponent<BoatModMarker>();
+                if (marker != null) Destroy(marker);
+            }
+            catch { }
         }
 
         private void Scan()
@@ -223,12 +452,18 @@ namespace BoatMod
                 }
             }
 
-            bool mineOnly = _resolvedType == "BoatController" || _resolvedType == "PlayerSynchronizer";
-            foreach (var obj in FindObjectsOfType(_boatType))
-                TrySwap(obj as Component, mineOnly);
+            try
+            {
+                bool mineOnly = _resolvedType == "BoatController" || _resolvedType == "PlayerSynchronizer";
+                foreach (var obj in FindObjectsOfType(_boatType))
+                    TrySwap(obj as Component, mineOnly);
+            }
+            catch (Exception e) { Log.LogError($"[BoatMod] race scan failed: {e}"); }
+            try { HandleBuilderPreview(); }
+            catch (Exception e) { Log.LogError($"[BoatMod] preview handle failed: {e}"); }
         }
 
-        private static Type FindType(string simpleName)
+        internal static Type FindType(string simpleName)
         {
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
@@ -290,19 +525,31 @@ namespace BoatMod
 
         private static bool IsMine(GameObject go)
         {
-            var pv = go.GetComponent("PhotonView") as Behaviour;
-            if (pv == null)
-                pv = go.GetComponentInChildren(FindType("PhotonView")) as Behaviour;
-            if (pv == null) return true;
-            var t = pv.GetType();
-            var prop = t.GetProperty("isMine") ?? t.GetProperty("IsMine");
-            if (prop != null) return Equals(true, prop.GetValue(pv, null));
-            var field = t.GetField("isMine") ?? t.GetField("IsMine");
-            if (field != null) return Equals(true, field.GetValue(pv));
-            return true;
+            try
+            {
+                var pv = go.GetComponent("PhotonView") as Behaviour;
+                if (pv == null)
+                {
+                    var pt = FindType("PhotonView");
+                    if (pt == null) return true;
+                    pv = go.GetComponentInChildren(pt) as Behaviour;
+                }
+                if (pv == null) return true;
+                var t = pv.GetType();
+                var prop = t.GetProperty("isMine") ?? t.GetProperty("IsMine");
+                if (prop != null) return Equals(true, prop.GetValue(pv, null));
+                var field = t.GetField("isMine") ?? t.GetField("IsMine");
+                if (field != null) return Equals(true, field.GetValue(pv));
+                return true;
+            }
+            catch (Exception e)
+            {
+                Log?.LogWarning($"[BoatMod] IsMine failed on '{go.name}': {e.Message}");
+                return true;
+            }
         }
 
-        private void ApplySwap(GameObject root)
+        private void ApplySwap(GameObject root, List<Renderer> recordHidden)
         {
             var originals = root.GetComponentsInChildren<Renderer>(true)
                 .Where(r => !(r is ParticleSystemRenderer) && !(r is TrailRenderer))
@@ -322,16 +569,7 @@ namespace BoatMod
             model.transform.SetParent(root.transform, false);
             model.transform.localRotation = Quaternion.Euler(0f, _rotY.Value, 0f);
 
-            foreach (var g in _groups)
-            {
-                var part = new GameObject(string.IsNullOrEmpty(g.MatName) ? "part" : g.MatName);
-                part.transform.SetParent(model.transform, false);
-                var mf = part.AddComponent<MeshFilter>();
-                mf.sharedMesh = g.ToMesh();
-                var mr = part.AddComponent<MeshRenderer>();
-                mr.sharedMaterial = MakeMaterial(g);
-                mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.On;
-            }
+            BuildParts(model);
 
             var ourLocal = new Bounds();
             var allFilters = model.GetComponentsInChildren<MeshFilter>();
@@ -374,6 +612,7 @@ namespace BoatMod
                         ? r.sharedMaterial.shader.name : "";
                     if (sn.Contains("TextMesh") || sn.StartsWith("GUI/")) continue;
                     r.enabled = false;
+                    recordHidden?.Add(r);
                 }
             }
 
@@ -381,6 +620,23 @@ namespace BoatMod
             Log.LogInfo(
                 $"[BoatMod] swapped visuals on '{root.name}' " +
                 $"(orig bounds {origBounds.size}, scale {extraScale:F3}, {ourRenderers.Length} parts)");
+        }
+
+        internal static void BuildParts(GameObject target)
+        {
+            var groups = Instance?._groups;
+            if (groups == null || groups.Count == 0) groups = StaticGroups;
+            if (groups == null || groups.Count == 0) return;
+            foreach (var g in groups)
+            {
+                var part = new GameObject(string.IsNullOrEmpty(g.MatName) ? "part" : g.MatName);
+                part.transform.SetParent(target.transform, false);
+                var mf = part.AddComponent<MeshFilter>();
+                mf.sharedMesh = g.ToMesh();
+                var mr = part.AddComponent<MeshRenderer>();
+                mr.sharedMaterial = MakeMaterial(g);
+                mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.On;
+            }
         }
 
         private static Material MakeMaterial(MeshGroup g)
