@@ -509,7 +509,6 @@ namespace BoatMod
                             if (!of) { ob = r.bounds; of = true; }
                             else ob.Encapsulate(r.bounds);
                         }
-                        UnityEngine.Object.Destroy(tmp);
                         var mb = new Bounds();
                         bool mf = false;
                         foreach (var f2 in go.GetComponentsInChildren<MeshFilter>())
@@ -521,6 +520,8 @@ namespace BoatMod
                         float ourFoot = Mathf.Max(0.001f, Mathf.Max(mb.size.x, mb.size.z));
                         if (of && origFoot > 0.001f) fitScale = origFoot / ourFoot;
                         log.LogInfo($"[BoatMod] fit: orig {ob.size:F2} our {mb.size:F2} scale {fitScale:F3}");
+                        TryTransplantSticker(tmp, go, fitScale, log);
+                        UnityEngine.Object.Destroy(tmp);
                     }
                     catch (Exception e) { log.LogWarning($"[BoatMod] fit failed: {e.Message}"); }
                 }
@@ -546,6 +547,31 @@ namespace BoatMod
             {
                 log.LogError($"[BoatMod] visual install failed: {e}");
             }
+        }
+
+        private static void TryTransplantSticker(GameObject lanaVisual, GameObject target, float fitScale, BepInEx.Logging.ManualLogSource log)
+        {
+            try
+            {
+                var stickerType = BoatModPlugin.FindType("Sticker");
+                if (stickerType == null) { log.LogWarning("[BoatMod] Sticker type not found"); return; }
+                Component src = null;
+                foreach (var c in lanaVisual.GetComponentsInChildren(stickerType, true))
+                {
+                    src = c as Component;
+                    if (src != null) break;
+                }
+                if (src == null) { log.LogWarning("[BoatMod] no Sticker found on original hull visual"); return; }
+                var srcT = src.transform;
+                var clone = UnityEngine.Object.Instantiate(srcT.gameObject, target.transform);
+                float inv = 1f / Mathf.Max(0.001f, fitScale);
+                clone.transform.localPosition = srcT.localPosition * inv;
+                clone.transform.localRotation = srcT.localRotation;
+                clone.transform.localScale = srcT.localScale * inv;
+                clone.SetActive(true);
+                log.LogInfo($"[BoatMod] transplanted Sticker '{clone.name}' local={clone.transform.localPosition} scale={clone.transform.localScale.x:F3}");
+            }
+            catch (Exception e) { log.LogWarning($"[BoatMod] sticker transplant failed: {e.Message}"); }
         }
 
         private static void AssignVisual(UnityEngine.Object target, GameObject visual, BepInEx.Logging.ManualLogSource log, string tag)
@@ -649,6 +675,33 @@ namespace BoatMod
             PatchShopRefresh(harmony);
         }
 
+        internal static void PatchSetFlagSafety(Harmony harmony)
+        {
+            if (_setFlagPatched) return;
+            try
+            {
+                var t = BoatModPlugin.FindType("ShopPreview");
+                var m = t?.GetMethod("SetFlag", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (m == null) { BoatModPlugin.Log.LogWarning("[BoatMod] ShopPreview.SetFlag not found for safety patch"); return; }
+                harmony.Patch(m, finalizer: new HarmonyMethod(typeof(HullIntegration).GetMethod(nameof(SetFlagFinalizer), BindingFlags.Static | BindingFlags.NonPublic)));
+                _setFlagPatched = true;
+                BoatModPlugin.Log.LogInfo("[BoatMod] hooked ShopPreview.SetFlag (safety finalizer)");
+            }
+            catch (Exception e)
+            {
+                BoatModPlugin.Log.LogWarning($"[BoatMod] SetFlag safety patch failed: {e.Message}");
+            }
+        }
+
+        private static bool _setFlagPatched;
+
+        private static Exception SetFlagFinalizer(Exception __exception)
+        {
+            if (__exception == null) return null;
+            BoatModPlugin.Log?.LogWarning($"[BoatMod] SetFlag failed, swallowed: {__exception.GetType().Name}: {__exception.Message}");
+            return null;
+        }
+
         internal static void PatchShopRefresh(Harmony harmony)
         {
             var targets = new HashSet<string>
@@ -694,15 +747,7 @@ namespace BoatMod
                 var root = comp.transform.root;
                 Transform ours = null;
                 foreach (Transform child in root)
-                {
-                    if (child.name != "hull_powertrain") continue;
-                    ours = child;
-                    if (!child.gameObject.activeSelf)
-                    {
-                        child.gameObject.SetActive(true);
-                        log?.LogInfo("[BoatMod] activated our hull clone after instantiate");
-                    }
-                }
+                    if (child.name == "hull_powertrain") ours = child;
                 var scn = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
                 var key = scn + "|" + root.name;
                 if (_instDumpKey == key) return;

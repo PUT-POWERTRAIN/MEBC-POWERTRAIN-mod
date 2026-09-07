@@ -16,7 +16,7 @@ namespace BoatMod
     {
         public const string PluginGuid = "mateusz.energyboatsimulator.custommodel";
         public const string PluginName = "BoatModelSwap";
-        public const string PluginVersion = "1.3.0";
+        public const string PluginVersion = "1.4.0";
 
         internal static ManualLogSource Log;
         internal static BoatModPlugin Instance;
@@ -82,6 +82,7 @@ namespace BoatMod
                 _harmony = new Harmony(PluginGuid);
                 PatchGameMethods();
                 HullIntegration.PatchSelectHull(_harmony);
+                HullIntegration.PatchSetFlagSafety(_harmony);
                 HullIntegration.EnsureIntegrated();
                 HullIntegration.EnsureShopItem();
                 HullIntegration.InstallVisual();
@@ -97,6 +98,10 @@ namespace BoatMod
                     catch (Exception e) { Log.LogError($"[BoatMod] visual install outer failed: {e}"); }
                     try { PatchGameMethods(); }
                     catch (Exception e) { Log.LogError($"[BoatMod] patch failed: {e}"); }
+                    try { HullIntegration.PatchSetFlagSafety(_harmony); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] setflag patch failed: {e}"); }
+                    try { StartCoroutine(DeferredSceneDump(scene.name)); }
+                    catch (Exception e) { Log.LogError($"[BoatMod] deferred dump start failed: {e}"); }
                     try
                     {
                         var sln = scene.name.ToLowerInvariant();
@@ -242,7 +247,6 @@ namespace BoatMod
         private int _lastPreviewSel = -999;
         private string _previewEmptyScene;
         private int _previewLogCounter;
-        private readonly Dictionary<int, List<Renderer>> _hiddenByPreview = new Dictionary<int, List<Renderer>>();
 
         internal void HandleBuilderPreview()
         {
@@ -281,32 +285,6 @@ namespace BoatMod
             {
                 _lastPreviewSel = sel;
                 Log.LogInfo($"[BoatMod] preview: sel={sel} ours={ours} instances={previews.Count}");
-            }
-            foreach (var comp in previews)
-            {
-                if (comp == null) continue;
-                var go = comp.gameObject;
-                if (sel == ours && ours >= 0)
-                {
-                    var marker = go.GetComponent<BoatModMarker>();
-                    bool hasModel = go.transform.Find("BoatMod_CustomModel") != null;
-                    if (marker != null && hasModel) continue;
-                    if (marker != null) Destroy(marker);
-                    try
-                    {
-                        var rec = new List<Renderer>();
-                        ApplySwap(go, rec);
-                        _hiddenByPreview[go.GetInstanceID()] = rec;
-                    }
-                    catch (Exception e)
-                    {
-                        Log.LogError($"[BoatMod] preview swap failed: {e.Message}");
-                    }
-                }
-                else
-                {
-                    RestorePreview(go);
-                }
             }
         }
 
@@ -396,26 +374,6 @@ namespace BoatMod
             return -1;
         }
 
-        private void RestorePreview(GameObject go)
-        {
-            try
-            {
-                var id = go.GetInstanceID();
-                foreach (Transform child in go.transform)
-                    if (child.name == "BoatMod_CustomModel")
-                        Destroy(child.gameObject);
-                if (_hiddenByPreview.TryGetValue(id, out var hidden))
-                {
-                    foreach (var r in hidden)
-                        if (r != null) r.enabled = true;
-                    _hiddenByPreview.Remove(id);
-                }
-                var marker = go.GetComponent<BoatModMarker>();
-                if (marker != null) Destroy(marker);
-            }
-            catch { }
-        }
-
         private void Scan()
         {
             if (_boatType == null)
@@ -461,6 +419,54 @@ namespace BoatMod
             catch (Exception e) { Log.LogError($"[BoatMod] race scan failed: {e}"); }
             try { HandleBuilderPreview(); }
             catch (Exception e) { Log.LogError($"[BoatMod] preview handle failed: {e}"); }
+        }
+
+        private readonly HashSet<string> _dumpedDeferred = new HashSet<string>();
+
+        private System.Collections.IEnumerator DeferredSceneDump(string sceneName)
+        {
+            yield return new WaitForSeconds(3f);
+            DumpStrayRenderers(sceneName, 3);
+            yield return new WaitForSeconds(5f);
+            DumpStrayRenderers(sceneName, 8);
+        }
+
+        private void DumpStrayRenderers(string sceneName, float atSec)
+        {
+            try
+            {
+                if (!_dumpedDeferred.Add($"{sceneName}|{atSec}")) return;
+                var scn = default(UnityEngine.SceneManagement.Scene);
+                for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++)
+                {
+                    var s = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                    if (s.name == sceneName) { scn = s; break; }
+                }
+                if (!scn.IsValid()) return;
+                Log.LogInfo($"[BoatMod] deferred renderer dump @{atSec}s scene '{sceneName}'");
+                foreach (var root in scn.GetRootGameObjects())
+                {
+                    var active = new List<Renderer>();
+                    foreach (var r in root.GetComponentsInChildren<Renderer>(true))
+                        if (r != null && r.enabled && r.gameObject.activeInHierarchy) active.Add(r);
+                    if (active.Count == 0) continue;
+                    var nl = root.name.ToLowerInvariant();
+                    if (nl.Contains("boat") || nl.Contains("hull") || nl.Contains("player"))
+                    {
+                        var parts = new List<string>();
+                        foreach (var r in active)
+                            parts.Add($"{r.gameObject.name}@{r.transform.position:F1} size={r.bounds.size:F1} mat={(r.sharedMaterial != null ? r.sharedMaterial.name : "null")}");
+                        Log.LogInfo($"[BoatMod] '{root.name}' active renderers ({active.Count}): {string.Join(" | ", parts)}");
+                    }
+                    else
+                    {
+                        Log.LogInfo($"[BoatMod] root '{root.name}' active renderers: {active.Count}");
+                        foreach (var r in active)
+                            Log.LogInfo($"[BoatMod]   stray '{root.name}/{r.gameObject.name}' @{r.transform.position:F1} size={r.bounds.size:F1} mat={(r.sharedMaterial != null ? r.sharedMaterial.name : "null")}");
+                    }
+                }
+            }
+            catch (Exception e) { Log.LogError($"[BoatMod] deferred dump failed: {e}"); }
         }
 
         internal static Type FindType(string simpleName)
