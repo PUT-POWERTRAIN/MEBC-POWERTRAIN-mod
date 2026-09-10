@@ -16,11 +16,12 @@ namespace BoatMod
     {
         public const string PluginGuid = "mateusz.energyboatsimulator.custommodel";
         public const string PluginName = "BoatModelSwap";
-        public const string PluginVersion = "1.4.0";
+        public const string PluginVersion = "1.5.0";
 
         internal static ManualLogSource Log;
         internal static BoatModPlugin Instance;
         internal static List<MeshGroup> StaticGroups;
+        internal static float s_scale = 1f, s_offX, s_offY, s_offZ, s_rotY;
 
         private ConfigEntry<bool> _enabled;
         private ConfigEntry<bool> _hideOriginal;
@@ -40,6 +41,15 @@ namespace BoatMod
         private bool _probeLogged;
         private bool _dumped;
 
+        private void CacheModelConfig()
+        {
+            s_scale = _scale?.Value ?? 1f;
+            s_offX = _offsetX?.Value ?? 0f;
+            s_offY = _offsetY?.Value ?? 0f;
+            s_offZ = _offsetZ?.Value ?? 0f;
+            s_rotY = _rotY?.Value ?? 0f;
+        }
+
         private void Awake()
         {
             Log = Logger;
@@ -58,6 +68,9 @@ namespace BoatMod
             _modelPath = Config.Bind("Model", "Path",
                 Path.Combine(Paths.PluginPath, "BoatMod", "boat.obj"),
                 "OBJ file to load (expects matching .mtl next to it)");
+
+            CacheModelConfig();
+            Config.SettingChanged += (s, e) => CacheModelConfig();
 
             try
             {
@@ -100,8 +113,13 @@ namespace BoatMod
                     catch (Exception e) { Log.LogError($"[BoatMod] patch failed: {e}"); }
                     try { HullIntegration.PatchSetFlagSafety(_harmony); }
                     catch (Exception e) { Log.LogError($"[BoatMod] setflag patch failed: {e}"); }
-                    try { StartCoroutine(DeferredSceneDump(scene.name)); }
-                    catch (Exception e) { Log.LogError($"[BoatMod] deferred dump start failed: {e}"); }
+                    try
+                    {
+                        float now = Time.unscaledTime;
+                        _pendingDumps.Add(new PendingDump { Scene = scene.name, Due = now + DumpDelay1, At = DumpDelay1 });
+                        _pendingDumps.Add(new PendingDump { Scene = scene.name, Due = now + DumpDelay2, At = DumpDelay2 });
+                    }
+                    catch (Exception e) { Log.LogError($"[BoatMod] dump schedule failed: {e}"); }
                     try
                     {
                         var sln = scene.name.ToLowerInvariant();
@@ -185,7 +203,12 @@ namespace BoatMod
             {
                 var self = Instance;
                 if (self == null || self._groups == null || !self._enabled.Value) return;
-                if (++self._tickCounter % 60 == 0) self.Scan();
+                PumpDumps();
+                if (++self._tickCounter % 60 == 0)
+                {
+                    self.Scan();
+                    HullIntegration.RehideNativeProps();
+                }
             }
             catch { }
         }
@@ -421,17 +444,33 @@ namespace BoatMod
             catch (Exception e) { Log.LogError($"[BoatMod] preview handle failed: {e}"); }
         }
 
-        private readonly HashSet<string> _dumpedDeferred = new HashSet<string>();
+        private static readonly HashSet<string> _dumpedDeferred = new HashSet<string>();
 
-        private System.Collections.IEnumerator DeferredSceneDump(string sceneName)
+        private struct PendingDump { public string Scene; public float Due; public float At; }
+
+        private const float DumpDelay1 = 3f;
+        private const float DumpDelay2 = 8f;
+
+        private static readonly List<PendingDump> _pendingDumps = new List<PendingDump>();
+
+        private static void PumpDumps()
         {
-            yield return new WaitForSeconds(3f);
-            DumpStrayRenderers(sceneName, 3);
-            yield return new WaitForSeconds(5f);
-            DumpStrayRenderers(sceneName, 8);
+            if (_pendingDumps.Count == 0) return;
+            try
+            {
+                float now = Time.unscaledTime;
+                for (int i = _pendingDumps.Count - 1; i >= 0; i--)
+                {
+                    var p = _pendingDumps[i];
+                    if (now < p.Due) continue;
+                    _pendingDumps.RemoveAt(i);
+                    DumpStrayRenderers(p.Scene, p.At);
+                }
+            }
+            catch (Exception e) { Log?.LogError($"[BoatMod] dump pump failed: {e}"); }
         }
 
-        private void DumpStrayRenderers(string sceneName, float atSec)
+        private static void DumpStrayRenderers(string sceneName, float atSec)
         {
             try
             {

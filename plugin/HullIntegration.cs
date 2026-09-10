@@ -521,17 +521,17 @@ namespace BoatMod
                         if (of && origFoot > 0.001f) fitScale = origFoot / ourFoot;
                         log.LogInfo($"[BoatMod] fit: orig {ob.size:F2} our {mb.size:F2} scale {fitScale:F3}");
                         TryTransplantSticker(tmp, go, fitScale, log);
+                        if (TryCopyColliders(tmp, go, fitScale, log) == 0)
+                            AddFallbackCollider(go, log);
                         UnityEngine.Object.Destroy(tmp);
                     }
                     catch (Exception e) { log.LogWarning($"[BoatMod] fit failed: {e.Message}"); }
                 }
 
                 var inst = BoatModPlugin.Instance;
-                float cfgScale = inst?._scale.Value ?? 1f;
-                float rotY = inst?._rotY.Value ?? 0f;
-                Vector3 cfgOffset = inst == null
-                    ? Vector3.zero
-                    : new Vector3(inst._offsetX.Value, inst._offsetY.Value, inst._offsetZ.Value);
+                float cfgScale = BoatModPlugin.s_scale;
+                float rotY = BoatModPlugin.s_rotY;
+                Vector3 cfgOffset = new Vector3(BoatModPlugin.s_offX, BoatModPlugin.s_offY, BoatModPlugin.s_offZ);
                 go.transform.localScale = Vector3.one * (fitScale * cfgScale);
                 go.transform.localPosition = origPos + cfgOffset;
                 go.transform.localRotation = origRot * Quaternion.Euler(0f, rotY, 0f);
@@ -572,6 +572,101 @@ namespace BoatMod
                 log.LogInfo($"[BoatMod] transplanted Sticker '{clone.name}' local={clone.transform.localPosition} scale={clone.transform.localScale.x:F3}");
             }
             catch (Exception e) { log.LogWarning($"[BoatMod] sticker transplant failed: {e.Message}"); }
+        }
+
+        private static int TryCopyColliders(GameObject src, GameObject dst, float fitScale, BepInEx.Logging.ManualLogSource log)
+        {
+            try
+            {
+                int n = 0;
+                float inv = 1f / Mathf.Max(0.001f, fitScale);
+                foreach (var col in src.GetComponentsInChildren<Collider>(true))
+                {
+                    if (col == null) continue;
+                    var srcT = col.transform;
+                    Vector3 shift = srcT != src.transform ? srcT.localPosition * inv : Vector3.zero;
+                    if (srcT != src.transform && Quaternion.Angle(srcT.localRotation, Quaternion.identity) > 1f)
+                        log.LogWarning($"[BoatMod] collider '{srcT.name}' rotated, copying with identity rotation");
+                    switch (col)
+                    {
+                        case BoxCollider b:
+                            {
+                                var nb = dst.AddComponent<BoxCollider>();
+                                nb.center = b.center + shift;
+                                nb.size = b.size;
+                                nb.enabled = col.enabled;
+                                n++;
+                                break;
+                            }
+                        case SphereCollider s:
+                            {
+                                var ns = dst.AddComponent<SphereCollider>();
+                                ns.center = s.center + shift;
+                                ns.radius = s.radius;
+                                ns.enabled = col.enabled;
+                                n++;
+                                break;
+                            }
+                        case CapsuleCollider c:
+                            {
+                                var nc = dst.AddComponent<CapsuleCollider>();
+                                nc.center = c.center + shift;
+                                nc.radius = c.radius;
+                                nc.height = c.height;
+                                nc.direction = c.direction;
+                                nc.enabled = col.enabled;
+                                n++;
+                                break;
+                            }
+                        case MeshCollider m:
+                            {
+                                var nm = dst.AddComponent<MeshCollider>();
+                                nm.sharedMesh = m.sharedMesh;
+                                nm.convex = true;
+                                nm.enabled = col.enabled;
+                                n++;
+                                break;
+                            }
+                        default:
+                            log.LogWarning($"[BoatMod] unsupported collider '{col.GetType().Name}' on '{srcT.name}' skipped");
+                            break;
+                    }
+                }
+                log.LogInfo($"[BoatMod] copied {n} collider(s) from original hull visual onto our visual root");
+                return n;
+            }
+            catch (Exception e)
+            {
+                log.LogWarning($"[BoatMod] collider copy failed: {e.Message}");
+                return 0;
+            }
+        }
+
+        private static void AddFallbackCollider(GameObject dst, BepInEx.Logging.ManualLogSource log)
+        {
+            try
+            {
+                var verts = new List<Vector3>();
+                var tris = new List<int>();
+                var rtow = dst.transform.worldToLocalMatrix;
+                foreach (var mf in dst.GetComponentsInChildren<MeshFilter>())
+                {
+                    var mesh = mf != null ? mf.sharedMesh : null;
+                    if (mesh == null) continue;
+                    var m = rtow * mf.transform.localToWorldMatrix;
+                    int b = verts.Count;
+                    foreach (var v in mesh.vertices) verts.Add(m.MultiplyPoint3x4(v));
+                    foreach (var t in mesh.triangles) tris.Add(b + t);
+                }
+                if (verts.Count == 0) { log.LogWarning("[BoatMod] fallback collider: no meshes found"); return; }
+                var combined = new Mesh { vertices = verts.ToArray(), triangles = tris.ToArray() };
+                combined.RecalculateBounds();
+                var mc = dst.AddComponent<MeshCollider>();
+                mc.sharedMesh = combined;
+                mc.convex = true;
+                log.LogInfo($"[BoatMod] fallback: convex mesh collider on visual root ({verts.Count} verts, {tris.Count / 3} tris)");
+            }
+            catch (Exception e) { log.LogWarning($"[BoatMod] fallback collider failed: {e.Message}"); }
         }
 
         private static void AssignVisual(UnityEngine.Object target, GameObject visual, BepInEx.Logging.ManualLogSource log, string tag)
@@ -705,7 +800,7 @@ namespace BoatMod
         internal static void PatchShopRefresh(Harmony harmony)
         {
             var targets = new HashSet<string>
-                { "EnableOrInstantiateHull", "SelectBoat", "CreateNewBoat", "HidePreview", "RefreshPreview", "UpdatePreview", "ShowPreview" };
+                { "EnableOrInstantiateHull", "SelectBoat", "CreateNewBoat", "HidePreview", "RefreshPreview", "UpdatePreview", "ShowPreview", "ShowItem" };
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
                 if (!asm.GetName().Name.Contains("Assembly")) continue;
@@ -724,7 +819,11 @@ namespace BoatMod
                         if (!targets.Contains(m.Name) || m.IsGenericMethodDefinition) continue;
                         try
                         {
-                            string hookName = m.Name == "EnableOrInstantiateHull" ? nameof(VisualInstantiatedHook) : nameof(ShopRefreshHook);
+                            string hookName =
+                                m.Name == "EnableOrInstantiateHull" ? nameof(VisualInstantiatedHook) :
+                                t.Name == "PropellerShopItem" && m.Name == "ShowPreview" ? nameof(PropellerShowHook) :
+                                m.Name == "ShowItem" ? nameof(ShowItemHook) :
+                                nameof(ShopRefreshHook);
                             var hook = typeof(HullIntegration).GetMethod(hookName, BindingFlags.Static | BindingFlags.NonPublic);
                             harmony.Patch(m, postfix: new HarmonyMethod(hook));
                             BoatModPlugin.Log.LogInfo($"[BoatMod] hooked {t.Name}.{m.Name}");
@@ -748,6 +847,7 @@ namespace BoatMod
                 Transform ours = null;
                 foreach (Transform child in root)
                     if (child.name == "hull_powertrain") ours = child;
+                if (ours != null) ApplyMountOffset(ours);
                 var scn = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
                 var key = scn + "|" + root.name;
                 if (_instDumpKey == key) return;
@@ -778,12 +878,219 @@ namespace BoatMod
                     }
                 }
                 if (ours != null)
+                {
                     log?.LogInfo($"[BoatMod] our clone '{ours.name}' active={ours.gameObject.activeSelf} localPos={ours.localPosition}");
+                    var cs = ours.GetComponentsInChildren<Collider>(true);
+                    var cdesc = new List<string>();
+                    foreach (var c in cs)
+                        cdesc.Add($"{c.GetType().Name}@{c.gameObject.name}{(c.enabled ? "" : "(disabled)")}");
+                    log?.LogInfo($"[BoatMod] colliders on our clone ({cs.Length}): [{string.Join(", ", cdesc)}]");
+                }
             }
             catch { }
         }
 
         private static readonly HashSet<string> _rendDumped = new HashSet<string>();
+
+        private static readonly Dictionary<int, int> _propLast = new Dictionary<int, int>();
+        private static readonly HashSet<int> _pointLogged = new HashSet<int>();
+        private static readonly Dictionary<int, Vector3> _cloneBase = new Dictionary<int, Vector3>();
+
+        private static void ApplyMountOffset(Transform ours)
+        {
+            try
+            {
+                int id = ours.gameObject.GetInstanceID();
+                if (!_cloneBase.TryGetValue(id, out var basePos))
+                {
+                    basePos = ours.localPosition;
+                    _cloneBase[id] = basePos;
+                    BoatModPlugin.Log?.LogInfo($"[BoatMod] mount base '{ours.name}': {basePos}");
+                }
+                var off = new Vector3(BoatModPlugin.s_offX, BoatModPlugin.s_offY, BoatModPlugin.s_offZ);
+                ours.localPosition = basePos + off;
+            }
+            catch { }
+        }
+
+        private static void PropellerShowHook(object __instance, object[] __args)
+        {
+            try
+            {
+                var log = BoatModPlugin.Log;
+                Component preview = null;
+                if (__args != null)
+                    foreach (var a in __args)
+                        if (a is Component c && c.GetType().Name == "ShopPreview") { preview = c; break; }
+                if (preview == null)
+                {
+                    var it = __instance as Component;
+                    var pt = it != null ? BoatModPlugin.FindType("ShopPreview") : null;
+                    if (it != null && pt != null)
+                    {
+                        var comps = it.GetComponentsInChildren(pt, true);
+                        if (comps.Length > 0) preview = comps[0] as Component;
+                    }
+                }
+                if (preview == null) return;
+                var root = preview.transform.root;
+                Transform ours = null;
+                foreach (Transform child in root)
+                    if (child.name == "hull_powertrain" && child.gameObject.activeSelf) ours = child;
+                if (ours == null) return;
+
+                int hidden = 0;
+                var pp = FindChildTransform(root, "Propeller point");
+                if (pp != null)
+                    foreach (Transform ch in pp)
+                        if (ch.gameObject.activeSelf) { ch.gameObject.SetActive(false); hidden++; }
+
+                int key = root.GetInstanceID();
+                _propLast.TryGetValue(key, out var last);
+                if (hidden != last)
+                {
+                    log?.LogInfo($"[BoatMod] propeller hidden on '{root.name}' ({hidden} deactivated, point={(pp != null ? "found" : "missing")})");
+                    _propLast[key] = hidden;
+                }
+
+                if (_pointLogged.Add(key))
+                {
+                    foreach (var pn in new[] { "Motor point", "Foil point" })
+                    {
+                        var t2 = FindChildTransform(root, pn);
+                        if (t2 == null) continue;
+                        var names = new List<string>();
+                        foreach (Transform ch in t2)
+                            names.Add($"{ch.name}(active={ch.gameObject.activeSelf})");
+                        log?.LogInfo($"[BoatMod] '{pn}' children: [{string.Join(", ", names)}]");
+                    }
+                }
+            }
+            catch (Exception e) { BoatModPlugin.Log?.LogWarning($"[BoatMod] propeller hide failed: {e.Message}"); }
+        }
+
+        private static Transform FindChildTransform(Transform t, string name)
+        {
+            if (t == null) return null;
+            if (t.name == name) return t;
+            foreach (Transform child in t)
+            {
+                var r = FindChildTransform(child, name);
+                if (r != null) return r;
+            }
+            return null;
+        }
+
+        private static readonly HashSet<int> _rootDumped = new HashSet<int>();
+        private static readonly HashSet<int> _hiddenRenders = new HashSet<int>();
+        private static readonly string[] _attachKw = { "prop", "motor", "rudder", "shaft", "skeg" };
+
+        private static void ShowItemHook(object __instance, object[] __args)
+        {
+            try
+            {
+                var log = BoatModPlugin.Log;
+                Component preview = null;
+                if (__instance is Component ic && ic.GetType().Name == "ShopPreview") preview = ic;
+                if (preview == null && __args != null)
+                    foreach (var a in __args)
+                        if (a is Component c && c.GetType().Name == "ShopPreview") { preview = c; break; }
+                if (preview == null)
+                {
+                    var pt = BoatModPlugin.FindType("ShopPreview");
+                    if (__instance is Component it && pt != null)
+                    {
+                        var comps = it.GetComponentsInChildren(pt, true);
+                        if (comps.Length > 0) preview = comps[0] as Component;
+                    }
+                }
+                if (preview == null) return;
+                var root = preview.transform.root;
+                Transform ours = null;
+                foreach (Transform child in root)
+                    if (child.name == "hull_powertrain" && child.gameObject.activeSelf) ours = child;
+                if (ours == null) return;
+                DumpRootRenderers(root, log);
+                HideNativeAttachments(root);
+            }
+            catch (Exception e) { BoatModPlugin.Log?.LogWarning($"[BoatMod] showitem hook failed: {e.Message}"); }
+        }
+
+        private static void DumpRootRenderers(Transform root, BepInEx.Logging.ManualLogSource log)
+        {
+            if (!_rootDumped.Add(root.GetInstanceID())) return;
+            var list = new List<string>();
+            foreach (var r in root.GetComponentsInChildren<Renderer>())
+            {
+                if (r == null || !r.enabled) continue;
+                var m = r.sharedMaterial;
+                list.Add($"{PathOf(r.transform)} ({(m != null ? m.name : "null")})");
+            }
+            log.LogInfo($"[BoatMod] '{root.name}' active renderers ({list.Count}): {string.Join(" | ", list)}");
+        }
+
+        internal static void RehideNativeProps()
+        {
+            try
+            {
+                int scn = UnityEngine.SceneManagement.SceneManager.sceneCount;
+                for (int s = 0; s < scn; s++)
+                {
+                    var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(s);
+                    if (!scene.isLoaded) continue;
+                    foreach (var root in scene.GetRootGameObjects())
+                    {
+                        bool ours = false;
+                        foreach (Transform ch in root.transform)
+                            if (ch.name == "hull_powertrain" && ch.gameObject.activeSelf) { ours = true; ApplyMountOffset(ch); break; }
+                        if (ours) HideNativeAttachments(root.transform);
+                        else RestoreHiddenUnder(root.transform);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void RestoreHiddenUnder(Transform root)
+        {
+            if (_hiddenRenders.Count == 0) return;
+            int restored = 0;
+            foreach (var r in root.GetComponentsInChildren<Renderer>(true))
+            {
+                if (r == null || r.gameObject == null) continue;
+                if (!r.gameObject.activeInHierarchy) continue;
+                if (!_hiddenRenders.Contains(r.GetInstanceID())) continue;
+                r.enabled = true;
+                _hiddenRenders.Remove(r.GetInstanceID());
+                restored++;
+            }
+            if (restored > 0)
+                BoatModPlugin.Log?.LogInfo($"[BoatMod] restored {restored} native attachment renderer(s) on '{root.name}'");
+        }
+
+        private static void HideNativeAttachments(Transform root)
+        {
+            int newly = 0;
+            foreach (var r in root.GetComponentsInChildren<Renderer>())
+            {
+                if (r == null || !r.enabled || r.gameObject == null) continue;
+                var n = r.gameObject.name.ToLowerInvariant();
+                bool hit = false;
+                foreach (var k in _attachKw) if (n.IndexOf(k, StringComparison.Ordinal) >= 0) { hit = true; break; }
+                if (!hit) continue;
+                r.enabled = false;
+                if (_hiddenRenders.Add(r.GetInstanceID())) newly++;
+            }
+            if (newly > 0)
+                BoatModPlugin.Log?.LogInfo($"[BoatMod] hidden {newly} native attachment renderer(s) on '{root.name}'");
+        }
+
+        private static string PathOf(Transform t)
+        {
+            var s = t.name;
+            while (t.parent != null) { t = t.parent; s = t.name + "/" + s; }
+            return s;
+        }
 
         internal static void DumpBoatRenderers()
         {
