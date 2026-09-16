@@ -7,7 +7,12 @@
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <Version>1.0.0</Version>
+    <GameDir Condition="'$(GameDir)' == ''">$(MEBC_GAME_DIR)</GameDir>
   </PropertyGroup>
+
+  <Target Name="EnsureGameDir" BeforeTargets="ResolveAssemblyReferences" Condition="'$(GameDir)' == ''">
+    <Error Text="GameDir is not set. Point it at your Energy Boat Simulator install, e.g. MEBC_GAME_DIR=/path/to/MEBC dotnet build, or dotnet build -p:GameDir=/path/to/MEBC" />
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
@@ -15,27 +20,27 @@
 
   <ItemGroup>
     <Reference Include="BepInEx">
-      <HintPath>..\..\MEBC\BepInEx\core\BepInEx.dll</HintPath>
+      <HintPath>$(GameDir)/BepInEx/core/BepInEx.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="0Harmony">
-      <HintPath>..\..\MEBC\BepInEx\core\0Harmony.dll</HintPath>
+      <HintPath>$(GameDir)/BepInEx/core/0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine">
-      <HintPath>..\..\MEBC\Energy Boat Simulator_Data\Managed\UnityEngine.dll</HintPath>
+      <HintPath>$(GameDir)/Energy Boat Simulator_Data/Managed/UnityEngine.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>..\..\MEBC\Energy Boat Simulator_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(GameDir)/Energy Boat Simulator_Data/Managed/UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.PhysicsModule">
-      <HintPath>..\..\MEBC\Energy Boat Simulator_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+      <HintPath>$(GameDir)/Energy Boat Simulator_Data/Managed/UnityEngine.PhysicsModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.ParticleSystemModule">
-      <HintPath>..\..\MEBC\Energy Boat Simulator_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
+      <HintPath>$(GameDir)/Energy Boat Simulator_Data/Managed/UnityEngine.ParticleSystemModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
