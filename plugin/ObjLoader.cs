@@ -21,6 +21,7 @@ namespace BoatMod
         {
             var m = new Mesh
             {
+                indexFormat = UnityEngine.Rendering.IndexFormat.UInt32,
                 vertices = Verts.ToArray(),
                 normals = Norms.ToArray(),
                 triangles = Tris.ToArray()

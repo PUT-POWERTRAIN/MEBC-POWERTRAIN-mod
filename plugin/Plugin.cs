@@ -16,7 +16,7 @@ namespace BoatMod
     {
         public const string PluginGuid = "mateusz.energyboatsimulator.custommodel";
         public const string PluginName = "BoatModelSwap";
-        public const string PluginVersion = "1.5.0";
+        public const string PluginVersion = "1.6.0";
 
         internal static ManualLogSource Log;
         internal static BoatModPlugin Instance;

@@ -33,7 +33,7 @@ while the custom model is shown.
 ## Install (players)
 
 1. Extract the base game to a folder, e.g. `C:\Games\MEBC`.
-2. Extract the contents of `MEBC-PowertrainMod-v1.5.0.zip` **into that same
+2. Extract the contents of `MEBC-PowertrainMod-v1.6.0.zip` **into that same
    folder**, merging/overwriting when prompted. You should end up with:
 
    ```
