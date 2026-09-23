@@ -521,8 +521,7 @@ namespace BoatMod
                         if (of && origFoot > 0.001f) fitScale = origFoot / ourFoot;
                         log.LogInfo($"[BoatMod] fit: orig {ob.size:F2} our {mb.size:F2} scale {fitScale:F3}");
                         TryTransplantSticker(tmp, go, fitScale, log);
-                        if (TryCopyColliders(tmp, go, fitScale, log) == 0)
-                            AddFallbackCollider(go, log);
+                        ReplaceCollidersWithConvex(go, log);
                         UnityEngine.Object.Destroy(tmp);
                     }
                     catch (Exception e) { log.LogWarning($"[BoatMod] fit failed: {e.Message}"); }
@@ -574,78 +573,12 @@ namespace BoatMod
             catch (Exception e) { log.LogWarning($"[BoatMod] sticker transplant failed: {e.Message}"); }
         }
 
-        private static int TryCopyColliders(GameObject src, GameObject dst, float fitScale, BepInEx.Logging.ManualLogSource log)
+        private static void ReplaceCollidersWithConvex(GameObject dst, BepInEx.Logging.ManualLogSource log)
         {
             try
             {
-                int n = 0;
-                float inv = 1f / Mathf.Max(0.001f, fitScale);
-                foreach (var col in src.GetComponentsInChildren<Collider>(true))
-                {
-                    if (col == null) continue;
-                    var srcT = col.transform;
-                    Vector3 shift = srcT != src.transform ? srcT.localPosition * inv : Vector3.zero;
-                    if (srcT != src.transform && Quaternion.Angle(srcT.localRotation, Quaternion.identity) > 1f)
-                        log.LogWarning($"[BoatMod] collider '{srcT.name}' rotated, copying with identity rotation");
-                    switch (col)
-                    {
-                        case BoxCollider b:
-                            {
-                                var nb = dst.AddComponent<BoxCollider>();
-                                nb.center = b.center + shift;
-                                nb.size = b.size;
-                                nb.enabled = col.enabled;
-                                n++;
-                                break;
-                            }
-                        case SphereCollider s:
-                            {
-                                var ns = dst.AddComponent<SphereCollider>();
-                                ns.center = s.center + shift;
-                                ns.radius = s.radius;
-                                ns.enabled = col.enabled;
-                                n++;
-                                break;
-                            }
-                        case CapsuleCollider c:
-                            {
-                                var nc = dst.AddComponent<CapsuleCollider>();
-                                nc.center = c.center + shift;
-                                nc.radius = c.radius;
-                                nc.height = c.height;
-                                nc.direction = c.direction;
-                                nc.enabled = col.enabled;
-                                n++;
-                                break;
-                            }
-                        case MeshCollider m:
-                            {
-                                var nm = dst.AddComponent<MeshCollider>();
-                                nm.sharedMesh = m.sharedMesh;
-                                nm.convex = true;
-                                nm.enabled = col.enabled;
-                                n++;
-                                break;
-                            }
-                        default:
-                            log.LogWarning($"[BoatMod] unsupported collider '{col.GetType().Name}' on '{srcT.name}' skipped");
-                            break;
-                    }
-                }
-                log.LogInfo($"[BoatMod] copied {n} collider(s) from original hull visual onto our visual root");
-                return n;
-            }
-            catch (Exception e)
-            {
-                log.LogWarning($"[BoatMod] collider copy failed: {e.Message}");
-                return 0;
-            }
-        }
-
-        private static void AddFallbackCollider(GameObject dst, BepInEx.Logging.ManualLogSource log)
-        {
-            try
-            {
+                foreach (var old in dst.GetComponentsInChildren<Collider>(true))
+                    UnityEngine.Object.DestroyImmediate(old);
                 var verts = new List<Vector3>();
                 var tris = new List<int>();
                 var rtow = dst.transform.worldToLocalMatrix;
@@ -658,15 +591,18 @@ namespace BoatMod
                     foreach (var v in mesh.vertices) verts.Add(m.MultiplyPoint3x4(v));
                     foreach (var t in mesh.triangles) tris.Add(b + t);
                 }
-                if (verts.Count == 0) { log.LogWarning("[BoatMod] fallback collider: no meshes found"); return; }
+                if (verts.Count == 0) { log.LogWarning("[BoatMod] convex collider: no meshes found"); return; }
                 var combined = new Mesh { vertices = verts.ToArray(), triangles = tris.ToArray() };
                 combined.RecalculateBounds();
                 var mc = dst.AddComponent<MeshCollider>();
                 mc.sharedMesh = combined;
                 mc.convex = true;
-                log.LogInfo($"[BoatMod] fallback: convex mesh collider on visual root ({verts.Count} verts, {tris.Count / 3} tris)");
+                if (BoatModPlugin.Instance != null && BoatModPlugin.Instance.Diag != null && BoatModPlugin.Instance.Diag.Value)
+                    log.LogInfo($"[BoatMod] convex collider local bounds center={combined.bounds.center:F2} size={combined.bounds.size:F2} ({verts.Count} verts, {tris.Count / 3} tris)");
+                else
+                    log.LogInfo($"[BoatMod] convex mesh collider on visual root ({verts.Count} verts, {tris.Count / 3} tris)");
             }
-            catch (Exception e) { log.LogWarning($"[BoatMod] fallback collider failed: {e.Message}"); }
+            catch (Exception e) { log.LogWarning($"[BoatMod] convex collider failed: {e.Message}"); }
         }
 
         private static void AssignVisual(UnityEngine.Object target, GameObject visual, BepInEx.Logging.ManualLogSource log, string tag)
