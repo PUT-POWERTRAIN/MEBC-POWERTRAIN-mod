@@ -23,6 +23,7 @@ namespace BoatMod
 
         private static ConfigEntry<bool> _calSteerSaved;
         private static ConfigEntry<float> _calSteerCenter, _calSteerLeft, _calSteerRight;
+        private static ConfigEntry<float> _calSteerRawLeft, _calSteerRawSpan, _calSteerTurnSign;
 
         private static Harmony _harmony;
         private static readonly Dictionary<Type, FieldInfo> _motorInputFields = new Dictionary<Type, FieldInfo>();
@@ -66,6 +67,7 @@ namespace BoatMod
         private static float _lastRawSteer;
         private static float _unwrappedSteer;
         private static bool _unwrapBaselinePending;
+        private static float _unwrapBaselineRaw;
 
         private static void TrackUnwrap(float raw)
         {
@@ -79,6 +81,7 @@ namespace BoatMod
         private static void ResetUnwrapBaseline(float raw)
         {
             _lastRawSteer = raw;
+            _unwrapBaselineRaw = raw;
             _unwrappedSteer = 0f;
             _unwrapBaselinePending = false;
         }
@@ -101,8 +104,10 @@ namespace BoatMod
         internal static void BindAndInit(ConfigFile cfg, Harmony harmony)
         {
             BindConfig(cfg);
-            if (_calSteerSaved.Value && Math.Abs(_calSteerCenter.Value) > 0.35f)
-                Log.LogWarning($"[BoatMod] wheel: saved steering center {_calSteerCenter.Value:F3} looks implausible (>0.35) - boat will steer weirdly until recalibrated (press {_calKey.Value})");
+            if (_calSteerSaved.Value && !PersistentCalUsable() && Math.Abs(_calSteerCenter.Value) > 0.35f)
+                Log.LogWarning($"[BoatMod] wheel: old-format calibration has implausible center {_calSteerCenter.Value:F3} (>0.35) - press {_calKey.Value} once to regenerate persistent calibration");
+            if (_calSteerSaved.Value && PersistentCalUsable())
+                Log.LogInfo($"[BoatMod] wheel: persistent calibration loaded: left@raw {_calSteerRawLeft.Value:F3} span {_calSteerRawSpan.Value:F2} sign {_calSteerTurnSign.Value:F0}");
             _harmony = harmony;
             int patched = 0;
             foreach (var name in new[] { "BoatInputActionsHandler", "BoatInputHandler" })
@@ -279,7 +284,7 @@ namespace BoatMod
             throttleRaw = ApplyDeadzone(throttleRaw, _pedalDeadzone.Value);
             brakeRaw = ApplyDeadzone(brakeRaw, _pedalDeadzone.Value);
 
-            float steerRaw = _calStep != 0 ? 0f : SteerFromCalibration(_unwrappedSteer);
+            float steerRaw = _calStep != 0 ? 0f : ComputeSteerSource(steerUnproc);
             if (_steerInv.Value) steerRaw = -steerRaw;
 
             _smSteer += (steerRaw - _smSteer) * steerSmooth;
@@ -456,19 +461,38 @@ namespace BoatMod
                         _calSteerLeft.Value = _wipLeft;
                         _calSteerRight.Value = _wipRight;
                         _calSteerSaved.Value = true;
-                        CalFeedback($"SAVED: center {_wipCenter:F3} (L {_wipLeft:F3} R {_wipRight:F3}) - go drive!");
-                        Log.LogInfo($"[BoatMod] wheel: CALIBRATION COMPLETE - center={_wipCenter:F3} derived from locks left={_wipLeft:F3} right={_wipRight:F3} (saved to config)");
+                        _calSteerRawLeft.Value = WrapCircle(_wipLeft + _unwrapBaselineRaw);
+                        _calSteerRawSpan.Value = _wipRight - _wipLeft;
+                        _calSteerTurnSign.Value = _wipRight >= _wipLeft ? 1f : -1f;
+                        _cfg?.Save();
+                        CalFeedback($"SAVED (persists across restarts): center {_wipCenter:F3} (L {_wipLeft:F3} R {_wipRight:F3}) - go drive!");
+                        Log.LogInfo($"[BoatMod] wheel: CALIBRATION COMPLETE - center={_wipCenter:F3} from locks L={_wipLeft:F3} R={_wipRight:F3}; persistent: rawLeft={_calSteerRawLeft.Value:F3} span={_calSteerRawSpan.Value:F2} sign={_calSteerTurnSign.Value:F0}");
                         break;
                     }
             }
         }
 
         private static bool _sessionHasCal;
+        private static ConfigFile _cfg;
 
-        private static float SteerFromCalibration(float raw)
+        private static bool PersistentCalUsable()
         {
-            if (!_sessionHasCal)
-                return 0f;
+            return _calSteerSaved != null && _calSteerSaved.Value
+                && _calSteerRawSpan.Value > 0.3f && _calSteerRawSpan.Value <= 2.05f
+                && Math.Abs(_calSteerTurnSign.Value) > 0.5f;
+        }
+
+        private static float ComputeSteerSource(float steerUnprocRaw)
+        {
+            if (_sessionHasCal)
+                return ShapeSteer(SteerUnwrappedToOut(_unwrappedSteer));
+            if (PersistentCalUsable())
+                return ShapeSteer(PersistentSteer(steerUnprocRaw));
+            return 0f;
+        }
+
+        private static float SteerUnwrappedToOut(float raw)
+        {
             float center = _calSteerCenter.Value;
             if (Math.Abs(center) > 0.35f) return 0f;   // implausible saved center -> treat as uncalibrated, keyboard passes through
             float left = _calSteerLeft.Value;
@@ -484,6 +508,21 @@ namespace BoatMod
                 float span = center - left;
                 outv = span > 0.0001f ? (raw - center) / span : 0f;
             }
+            return Mathf.Clamp(outv, -1f, 1f);
+        }
+
+        private static float PersistentSteer(float raw)
+        {
+            float span = _calSteerRawSpan.Value;
+            float sign = _calSteerTurnSign.Value;
+            float d = WrapCycle((raw - _calSteerRawLeft.Value) * sign);
+            if (d < 0.02f && _outSteer > 0.5f) d = span;   // parked on the right lock: the locks share one circle point
+            if (d > span) d = span;
+            return d / (span * 0.5f) - 1f;
+        }
+
+        private static float ShapeSteer(float outv)
+        {
             outv = Mathf.Clamp(outv, -1f, 1f);
             float dz = Mathf.Max(0f, _steerDeadzone.Value);
             if (Mathf.Abs(outv) <= dz) return 0f;
@@ -491,6 +530,16 @@ namespace BoatMod
             float shaped = Mathf.Sign(outv) * Mathf.Pow(Mathf.Abs(outv), curve);
             if (Mathf.Abs(shaped) < Mathf.Max(0f, _centerSnap.Value)) return 0f;
             return shaped;
+        }
+
+        private static float WrapCircle(float v)
+        {
+            return v - 2f * Mathf.Floor((v + 1f) / 2f);
+        }
+
+        private static float WrapCycle(float v)
+        {
+            return v - 2f * Mathf.Floor(v / 2f);
         }
 
         #endregion
@@ -640,10 +689,12 @@ namespace BoatMod
                 }
                 _captured = true;
                 _throttleRange = _brakeRange = 0.3f;
-                if (_calSteerSaved.Value)
-                    Log.LogInfo($"[BoatMod] wheel: using saved steering calibration center={_calSteerCenter.Value:F3} left={_calSteerLeft.Value:F3} right={_calSteerRight.Value:F3} (press {_calKey.Value} to recalibrate)");
+                if (_calSteerSaved.Value && PersistentCalUsable() && !_sessionHasCal)
+                    Log.LogInfo($"[BoatMod] wheel: using PERSISTENT steering calibration (raw left {_calSteerRawLeft.Value:F3}, span {_calSteerRawSpan.Value:F2}, sign {_calSteerTurnSign.Value:F0}) - no wizard needed; press {_calKey.Value} to retake");
+                else if (_calSteerSaved.Value)
+                    Log.LogInfo($"[BoatMod] wheel: using session steering calibration center={_calSteerCenter.Value:F3} left={_calSteerLeft.Value:F3} right={_calSteerRight.Value:F3} (press {_calKey.Value} to recalibrate)");
                 else
-                    Log.LogInfo($"[BoatMod] wheel: no saved steering calibration - run it (press {_calKey.Value} to start, see log steps). pedals rest t={_restThrottle:F2} b={_restBrake:F2}");
+                    Log.LogInfo($"[BoatMod] wheel: no saved steering calibration - run wizard once (press {_calKey.Value}; after two lock captures it persists across restarts). pedals rest t={_restThrottle:F2} b={_restBrake:F2}");
                 return;
             }
             if (_throttle == null && _brake == null) return;
@@ -689,6 +740,7 @@ namespace BoatMod
 
         private static void BindConfig(ConfigFile cfg)
         {
+            _cfg = cfg;
             _enabled = cfg.Bind("Wheel", "Enabled", true, "Drive the boat with the MOZA R3 wheel/pedals (master switch)");
             _deviceName = cfg.Bind("Wheel", "DeviceName", "Gudsen", "Substring match for the joystick device (empty = first joystick found)");
             _steerCtl = cfg.Bind("Wheel", "SteerControl", "stick/x", "Wheel axis control path (see wheel control dump in the log)");
@@ -708,9 +760,12 @@ namespace BoatMod
             _guiKey = cfg.Bind("Wheel", "DebugKey", "F3", "Keyboard key that toggles the wheel debug overlay (show during calibration regardless)");
 
             _calSteerSaved = cfg.Bind("Wheel", "SteerCalibrated", false, "Internal: steering calibration present");
-            _calSteerCenter = cfg.Bind("Wheel", "SteerCenter", 0f, "Internal: calibrated steering center (raw value)");
+            _calSteerCenter = cfg.Bind("Wheel", "SteerCenter", 0f, "Internal: calibrated steering center (session raw value)");
             _calSteerLeft = cfg.Bind("Wheel", "SteerLeft", 0f, "Internal: full LEFT lock raw value");
             _calSteerRight = cfg.Bind("Wheel", "SteerRight", 0f, "Internal: full RIGHT lock raw value");
+            _calSteerRawLeft = cfg.Bind("Wheel", "SteerRawLeft", 0f, "Internal: LEFT lock on the hardware angle circle (persists across restarts)");
+            _calSteerRawSpan = cfg.Bind("Wheel", "SteerRawSpan", 0f, "Internal: lock-to-lock distance in unwrapped units (~2.0 for a 900 degree wheel)");
+            _calSteerTurnSign = cfg.Bind("Wheel", "SteerTurnSign", 1f, "Internal: +1 if turning right increases the raw axis, -1 otherwise");
         }
 
         private static Type FindType(string simpleName)
@@ -726,9 +781,11 @@ namespace BoatMod
 
         private static string CalStatusLine()
         {
-            if (!_sessionHasCal)
-                return "not calibrated THIS session - press " + (_calKey?.Value ?? "K") + " to run wizard (axis is wrap-around: locks must be taken every boot)";
-            return $"cal: center {_calSteerCenter.Value:F3}  L {_calSteerLeft.Value:F3}  R {_calSteerRight.Value:F3}";
+            if (_sessionHasCal)
+                return $"cal: center {_calSteerCenter.Value:F3}  L {_calSteerLeft.Value:F3}  R {_calSteerRight.Value:F3}";
+            if (PersistentCalUsable())
+                return $"PERSISTENT cal active (restarts OK): left@{WrapCircle(_calSteerRawLeft.Value):F3} span {_calSteerRawSpan.Value:F2} (wizard not needed; {_calKey?.Value ?? "K"} to retake)";
+            return "not calibrated - press " + (_calKey?.Value ?? "K") + " to run the wizard once (saved calibration then survives restarts)";
         }
 
         private static string CalStepText()
@@ -812,6 +869,7 @@ namespace BoatMod
         private static void EnsureUiText()
         {
             bool want = _guiVisible || _calStep != 0;
+            SetOverlayActive(want);
             if (_uiTextFailed || !want) return;
             if (_nextUiTry > Time.unscaledTime) return;
             _nextUiTry = Time.unscaledTime + 2f;
