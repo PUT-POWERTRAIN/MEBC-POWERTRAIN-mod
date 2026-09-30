@@ -17,6 +17,8 @@ namespace BoatMod
         private static ConfigEntry<string> _steerCtl, _throttleCtl, _brakeCtl;
         private static ConfigEntry<bool> _steerInv, _throttleInv, _brakeInv;
         private static ConfigEntry<float> _steerDeadzone, _pedalDeadzone, _smoothing;
+        private static ConfigEntry<float> _steerSmooth, _centerSnap, _steerCurve;
+        private static ConfigEntry<bool> _directRudder;
         private static ConfigEntry<string> _calKey;
 
         private static ConfigEntry<bool> _calSteerSaved;
@@ -25,6 +27,9 @@ namespace BoatMod
         private static Harmony _harmony;
         private static readonly Dictionary<Type, FieldInfo> _motorInputFields = new Dictionary<Type, FieldInfo>();
         private static readonly Dictionary<Type, FieldInfo> _inputEnabledFields = new Dictionary<Type, FieldInfo>();
+        private static readonly Dictionary<Type, FieldInfo> _motorAngleFields = new Dictionary<Type, FieldInfo>();
+        private static readonly Dictionary<Type, FieldInfo> _motorFields = new Dictionary<Type, FieldInfo>();
+        private static readonly Dictionary<Type, MethodInfo> _motorSetAngle = new Dictionary<Type, MethodInfo>();
 
         private static Joystick _device;
         private static AxisControl _steer, _throttle, _brake;
@@ -42,6 +47,14 @@ namespace BoatMod
         private static int _calSamples;
         private static float _calLiveAt;
         private static float _wipCenter, _wipLeft, _wipRight;
+        private static string _calMsg;
+        private static float _calMsgUntil;
+
+        private static void CalFeedback(string msg)
+        {
+            _calMsg = msg;
+            _calMsgUntil = Time.unscaledTime + 8f;
+        }
 
         private static GameObject _guiGO;
         private static float _nextGuiRecreate;
@@ -49,6 +62,26 @@ namespace BoatMod
 
         private static readonly float[] _ring = new float[64];
         private static int _ringIdx, _ringCount;
+
+        private static float _lastRawSteer;
+        private static float _unwrappedSteer;
+        private static bool _unwrapBaselinePending;
+
+        private static void TrackUnwrap(float raw)
+        {
+            float delta = raw - _lastRawSteer;
+            if (delta > 1f) delta -= 2f;
+            else if (delta < -1f) delta += 2f;
+            _lastRawSteer = raw;
+            _unwrappedSteer += delta;
+        }
+
+        private static void ResetUnwrapBaseline(float raw)
+        {
+            _lastRawSteer = raw;
+            _unwrappedSteer = 0f;
+            _unwrapBaselinePending = false;
+        }
 
         private static ConfigEntry<bool> _diag;
         private static ConfigEntry<string> _guiKey;
@@ -80,8 +113,10 @@ namespace BoatMod
                 if (m == null || m.DeclaringType != t) continue;
                 try
                 {
-                    _harmony.Patch(m, prefix: new HarmonyMethod(typeof(WheelInput), nameof(MotorInputPrefix)));
-                    BoatModPlugin.Log.LogInfo($"[BoatMod] wheel: hooked {name}.FixedUpdate");
+                    _harmony.Patch(m,
+                        prefix: new HarmonyMethod(typeof(WheelInput), nameof(MotorInputPrefix)),
+                        postfix: new HarmonyMethod(typeof(WheelInput), nameof(MotorInputPostfix)));
+                    BoatModPlugin.Log.LogInfo($"[BoatMod] wheel: hooked {name}.FixedUpdate (prefix merge + postfix direct-rudder gated)");
                     patched++;
                 }
                 catch (Exception e)
@@ -173,6 +208,7 @@ namespace BoatMod
                 if (_device == null) return;
                 ResolveControls(_device);
                 StartCapture();
+                _unwrapBaselinePending = true;
                 Log.LogInfo($"[BoatMod] wheel: device '{_device.displayName}' description='{_device.description.product}'");
                 return;
             }
@@ -183,13 +219,37 @@ namespace BoatMod
                 return;
             }
 
+            if (_device != null)
+            {
+                bool present = false;
+                try
+                {
+                    foreach (var d in Joystick.all)
+                        if (d == _device) { present = true; break; }
+                }
+                catch { }
+                if (!present)
+                {
+                    Log.LogWarning("[BoatMod] wheel: device vanished from InputSystem - rescanning");
+                    _device = null;
+                    _captured = false;
+                    _steer = _throttle = _brake = null;
+                    _injectOn = false;
+                    return;
+                }
+            }
+
             Vector3 raw;
+            float steerUnproc;
             try
             {
                 raw = new Vector3(
                     _steer != null ? _steer.ReadValue() : 0f,
                     _throttle != null ? _throttle.ReadValue() : 0f,
                     _brake != null ? _brake.ReadValue() : 0f);
+                steerUnproc = _steer != null ? _steer.ReadUnprocessedValue() : 0f;
+                if (_unwrapBaselinePending) ResetUnwrapBaseline(steerUnproc);
+                else TrackUnwrap(steerUnproc);
             }
             catch
             {
@@ -203,13 +263,14 @@ namespace BoatMod
             float dt = Time.unscaledTime - _lastFrame;
             _lastFrame = Time.unscaledTime;
             if (dt <= 0f || dt > 0.5f) dt = 0.016f;
-            float smooth = Mathf.Clamp01(1f - Mathf.Exp(-dt / Mathf.Max(0.001f, _smoothing.Value)));
+            float pedalSmooth = Mathf.Clamp01(1f - Mathf.Exp(-dt / Mathf.Max(0.001f, _smoothing.Value)));
+            float steerSmooth = Mathf.Clamp01(1f - Mathf.Exp(-dt / Mathf.Max(0.001f, _steerSmooth.Value)));
 
-            _ring[_ringIdx] = raw.x;
+            _ring[_ringIdx] = _unwrappedSteer;
             _ringIdx = (_ringIdx + 1) % _ring.Length;
             if (_ringCount < _ring.Length) _ringCount++;
 
-            if (HandleCalibration(raw.x)) return;
+            if (HandleCalibration(_unwrappedSteer)) return;
 
             float throttleRaw = Remap(raw.y, _restThrottle, ref _throttleRange, symmetric: false);
             float brakeRaw = Remap(raw.z, _restBrake, ref _brakeRange, symmetric: false);
@@ -218,12 +279,12 @@ namespace BoatMod
             throttleRaw = ApplyDeadzone(throttleRaw, _pedalDeadzone.Value);
             brakeRaw = ApplyDeadzone(brakeRaw, _pedalDeadzone.Value);
 
-            float steerRaw = _calStep != 0 ? 0f : SteerFromCalibration(raw.x);
+            float steerRaw = _calStep != 0 ? 0f : SteerFromCalibration(_unwrappedSteer);
             if (_steerInv.Value) steerRaw = -steerRaw;
 
-            _smSteer += (steerRaw - _smSteer) * smooth;
-            _smThrottle += (throttleRaw - _smThrottle) * smooth;
-            _smBrake += (brakeRaw - _smBrake) * smooth;
+            _smSteer += (steerRaw - _smSteer) * steerSmooth;
+            _smThrottle += (throttleRaw - _smThrottle) * pedalSmooth;
+            _smBrake += (brakeRaw - _smBrake) * pedalSmooth;
 
             _outSteer = Mathf.Clamp(_smSteer, -1f, 1f);
             _outPedal = Mathf.Clamp(_smThrottle - _smBrake, -1f, 1f);
@@ -232,7 +293,7 @@ namespace BoatMod
             if (_diag != null && _diag.Value && Time.unscaledTime - _nextDiagLog > 5f)
             {
                 _nextDiagLog = Time.unscaledTime;
-                Log.LogInfo($"[BoatMod] wheel: steer={_outSteer:F2} pedal={_outPedal:F2} raw(r={raw.x:F2} t={raw.y:F2} b={raw.z:F2}) ranges(t={_throttleRange:F2} b={_brakeRange:F2})");
+                Log.LogInfo($"[BoatMod] wheel: steer={_outSteer:F2} pedal={_outPedal:F2} raw(r={raw.x:F2} u={steerUnproc:F2} w={_unwrappedSteer:F2} t={raw.y:F2} b={raw.z:F2}) ranges(t={_throttleRange:F2} b={_brakeRange:F2})");
             }
         }
 
@@ -288,7 +349,7 @@ namespace BoatMod
             if (now - _calLiveAt > 1f)
             {
                 _calLiveAt = now;
-                string stepName = _calStep == 1 ? "center-hold" : _calStep == 2 ? "left-hold" : "right-hold";
+                string stepName = _calStep == 1 ? "left-hold" : "right-hold";
                 Log.LogInfo($"[BoatMod] wheel: cal ({stepName}) live raw={rawSteer:F3}");
             }
 
@@ -297,13 +358,9 @@ namespace BoatMod
                 case 1:
                     _calSum += rawSteer;
                     _calSamples++;
-                    return false;
-                case 2:
-                    _calSum += rawSteer;
-                    _calSamples++;
                     if (rawSteer < _wipLeft) _wipLeft = rawSteer;
                     return false;
-                case 3:
+                case 2:
                     _calSum += rawSteer;
                     _calSamples++;
                     if (rawSteer > _wipRight) _wipRight = rawSteer;
@@ -312,27 +369,30 @@ namespace BoatMod
             return false;
         }
 
-        private static float RingRecent(int n)
+        private static float RingRecentMin(int n)
         {
             n = Math.Min(Math.Min(n, _ringCount), _ring.Length);
             if (n <= 0) return 0f;
-            float s = 0f;
-            for (int i = 0; i < n; i++) s += _ring[(_ringIdx - 1 - i + _ring.Length * 2) % _ring.Length];
-            return s / n;
-        }
-
-        private static float RingRecentSpread(int n)
-        {
-            n = Math.Min(Math.Min(n, _ringCount), _ring.Length);
-            if (n <= 0) return 0f;
-            float lo = float.MaxValue, hi = float.MinValue;
+            float lo = float.MaxValue;
             for (int i = 0; i < n; i++)
             {
                 float v = _ring[(_ringIdx - 1 - i + _ring.Length * 2) % _ring.Length];
                 if (v < lo) lo = v;
+            }
+            return lo;
+        }
+
+        private static float RingRecentMax(int n)
+        {
+            n = Math.Min(Math.Min(n, _ringCount), _ring.Length);
+            if (n <= 0) return 0f;
+            float hi = float.MinValue;
+            for (int i = 0; i < n; i++)
+            {
+                float v = _ring[(_ringIdx - 1 - i + _ring.Length * 2) % _ring.Length];
                 if (v > hi) hi = v;
             }
-            return hi - lo;
+            return hi;
         }
 
         private static void NextCalStep()
@@ -346,58 +406,71 @@ namespace BoatMod
                     _calStartedAt = now;
                     _calSum = 0f;
                     _calSamples = 0;
-                    Log.LogInfo("[BoatMod] wheel: CALIBRATION started - step 1/3: HOLD WHEEL CENTERED, press key again when ready");
+                    _wipLeft = 10f;
+                    _wipRight = -10f;
+                    _wipCenter = 0f;
+                    CalFeedback("wizard started - keep overlay open, follow the steps");
+                    Log.LogInfo("[BoatMod] wheel: CALIBRATION started - step 1/3: TURN WHEEL FULL LEFT (against the stop) AND HOLD, press key again");
                     break;
                 case 1:
                     {
-                        if (_calSamples < 10) { Log.LogWarning($"[BoatMod] wheel: center sample too short ({_calSamples} frames), press key again"); return; }
-                        float recent = RingRecent(20);
-                        float spread = RingRecentSpread(20);
-                        _wipCenter = recent;
+                        if (_calSamples < 10) { Log.LogWarning($"[BoatMod] wheel: left sample too short, press key again"); return; }
+                        float recentMin = RingRecentMin(32);
+                        if (Math.Abs(recentMin - _wipLeft) > 0.05f)
+                        {
+                            CalFeedback($"left lock not at stop right now ({recentMin:F3}) - FULL left, hold, press key");
+                            Log.LogWarning($"[BoatMod] wheel: left lock not held recently (recent min {recentMin:F3} vs best {_wipLeft:F3}) - go FULL left against the stop, hold ~1s, press key");
+                            return;
+                        }
                         _calStep = 2;
                         _calStartedAt = now;
                         _calSum = 0f;
                         _calSamples = 0;
-                        _wipLeft = _wipCenter;
-                        Log.LogInfo($"[BoatMod] wheel: center = {_wipCenter:F3} (recent-window of 20, spread {spread:F3}{(spread > 0.2f ? " WARNING: wheel moving during hold" : "")}) - step 2/3: TURN WHEEL FULL LEFT AND HOLD, press key again");
+                        CalFeedback($"left lock {_wipLeft:F3} ACCEPTED - now turn FULL right");
+                        Log.LogInfo($"[BoatMod] wheel: left lock = {_wipLeft:F3} - step 2/3: TURN WHEEL FULL RIGHT (against the stop) AND HOLD, press key again");
                         break;
                     }
                 case 2:
                     {
-                        if (_calSamples < 10) { Log.LogWarning($"[BoatMod] wheel: left sample too short, press key again"); return; }
-                        _calStep = 3;
-                        _calStartedAt = now;
-                        _calSum = 0f;
-                        _calSamples = 0;
-                        _wipRight = _wipCenter;
-                        Log.LogInfo($"[BoatMod] wheel: left lock = {_wipLeft:F3} (center {_wipCenter:F3}) - step 3/3: TURN WHEEL FULL RIGHT AND HOLD, press key again");
-                        break;
-                    }
-                case 3:
-                    {
                         if (_calSamples < 10) { Log.LogWarning($"[BoatMod] wheel: right sample too short, press key again"); return; }
-                        _calStep = 0;
-                        _calStartedAt = 0f;
-                        if (Math.Abs(_wipLeft - _wipCenter) < 0.05f || Math.Abs(_wipRight - _wipCenter) < 0.05f)
+                        float recentMax = RingRecentMax(32);
+                        if (Math.Abs(recentMax - _wipRight) > 0.05f)
                         {
-                            Log.LogWarning("[BoatMod] wheel: calibration looks degenerate (locks too close to center), NOT saved - previous calibration kept: " + CalStatusLine());
+                            CalFeedback($"right lock not at stop right now ({recentMax:F3}) - FULL right, hold, press key");
+                            Log.LogWarning($"[BoatMod] wheel: right lock not held recently (recent max {recentMax:F3} vs best {_wipRight:F3}) - go FULL right against the stop, hold ~1s, press key");
+                            return;
+                        }
+                        if (Math.Abs(_wipRight - _wipLeft) < 0.5f)
+                        {
+                            CalFeedback($"REJECTED: locks too close (L {_wipLeft:F3} R {_wipRight:F3}) - retake");
+                            Log.LogWarning($"[BoatMod] wheel: calibration degenerate (left {_wipLeft:F3} vs right {_wipRight:F3}, span < 0.5), NOT saved - previous calibration kept: " + CalStatusLine());
+                            _calStep = 0;
+                            _calStartedAt = 0f;
                             break;
                         }
+                        _wipCenter = (_wipLeft + _wipRight) / 2f;
+                        _calStep = 0;
+                        _calStartedAt = 0f;
+                        _sessionHasCal = true;
                         _calSteerCenter.Value = _wipCenter;
                         _calSteerLeft.Value = _wipLeft;
                         _calSteerRight.Value = _wipRight;
                         _calSteerSaved.Value = true;
-                        Log.LogInfo($"[BoatMod] wheel: CALIBRATION COMPLETE - center={_wipCenter:F3} left={_wipLeft:F3} right={_wipRight:F3} (saved to config)");
+                        CalFeedback($"SAVED: center {_wipCenter:F3} (L {_wipLeft:F3} R {_wipRight:F3}) - go drive!");
+                        Log.LogInfo($"[BoatMod] wheel: CALIBRATION COMPLETE - center={_wipCenter:F3} derived from locks left={_wipLeft:F3} right={_wipRight:F3} (saved to config)");
                         break;
                     }
             }
         }
 
+        private static bool _sessionHasCal;
+
         private static float SteerFromCalibration(float raw)
         {
-            if (!_calSteerSaved.Value)
+            if (!_sessionHasCal)
                 return 0f;
             float center = _calSteerCenter.Value;
+            if (Math.Abs(center) > 0.35f) return 0f;   // implausible saved center -> treat as uncalibrated, keyboard passes through
             float left = _calSteerLeft.Value;
             float right = _calSteerRight.Value;
             float outv;
@@ -412,10 +485,29 @@ namespace BoatMod
                 outv = span > 0.0001f ? (raw - center) / span : 0f;
             }
             outv = Mathf.Clamp(outv, -1f, 1f);
-            return ApplyDeadzone(outv, _steerDeadzone.Value);
+            float dz = Mathf.Max(0f, _steerDeadzone.Value);
+            if (Mathf.Abs(outv) <= dz) return 0f;
+            float curve = Mathf.Max(0.1f, _steerCurve.Value);
+            float shaped = Mathf.Sign(outv) * Mathf.Pow(Mathf.Abs(outv), curve);
+            if (Mathf.Abs(shaped) < Mathf.Max(0f, _centerSnap.Value)) return 0f;
+            return shaped;
         }
 
         #endregion
+
+        private static void InitInputRefs(Type t, out FieldInfo field, out FieldInfo enableField)
+        {
+            if (!_motorInputFields.TryGetValue(t, out field))
+            {
+                field = t.GetField("_motorInput", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                _motorInputFields[t] = field;
+            }
+            if (!_inputEnabledFields.TryGetValue(t, out enableField))
+            {
+                enableField = t.GetField("IsInputEnabled", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                _inputEnabledFields[t] = enableField;
+            }
+        }
 
         private static void MotorInputPrefix(object __instance)
         {
@@ -424,23 +516,53 @@ namespace BoatMod
             {
                 var t = __instance.GetType();
                 if (!t.Name.Contains("BoatInput")) return;
-                if (!_motorInputFields.TryGetValue(t, out var field))
-                {
-                    field = t.GetField("_motorInput", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-                    _motorInputFields[t] = field;
-                }
+                InitInputRefs(t, out var field, out var enableField);
                 if (field == null) return;
-                if (!_inputEnabledFields.TryGetValue(t, out var enableField))
-                {
-                    enableField = t.GetField("IsInputEnabled", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                    _inputEnabledFields[t] = enableField;
-                }
                 if (enableField != null && !Equals(true, enableField.GetValue(__instance))) return;
                 var current = (Vector2)field.GetValue(__instance);
                 var merged = new Vector2(
-                    Mathf.Abs(_outSteer) > 0.001f ? _outSteer : current.x,
+                    Mathf.Abs(_outSteer) > 0.001f ? -_outSteer : current.x,
                     Mathf.Abs(_outPedal) > 0.001f ? _outPedal : current.y);
                 field.SetValue(__instance, merged);
+            }
+            catch { }
+        }
+
+        private static void MotorInputPostfix(object __instance)
+        {
+            if (_directRudder == null || !_directRudder.Value) return;
+            try
+            {
+                var t = __instance.GetType();
+                if (!t.Name.Contains("BoatInput")) return;
+                InitInputRefs(t, out var field, out var enableField);
+                if (field == null) return;
+                if (enableField != null && !Equals(true, enableField.GetValue(__instance))) return;
+                if (!_motorAngleFields.TryGetValue(t, out var angleField))
+                {
+                    angleField = t.GetField("_motorAngle", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    _motorAngleFields[t] = angleField;
+                }
+                if (!_motorFields.TryGetValue(t, out var motorField))
+                {
+                    motorField = t.GetField("_motor", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    _motorFields[t] = motorField;
+                }
+                if (angleField == null || motorField == null) return;
+                var mi = (Vector2)field.GetValue(__instance);
+                float x = Mathf.Clamp(mi.x, -1f, 1f);
+                if (Mathf.Abs(x) < 0.0005f) x = 0f;
+                float angle = 0.5f + 0.5f * x;
+                angleField.SetValue(__instance, angle);
+                var motor = motorField.GetValue(__instance);
+                if (motor == null) return;
+                var motorType = motor.GetType();
+                if (!_motorSetAngle.TryGetValue(motorType, out var setAngle))
+                {
+                    setAngle = motorType.GetMethod("SetAngle", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(float) }, null);
+                    _motorSetAngle[motorType] = setAngle;
+                }
+                setAngle?.Invoke(motor, new object[] { angle });
             }
             catch { }
         }
@@ -575,9 +697,13 @@ namespace BoatMod
             _steerInv = cfg.Bind("Wheel", "SteerInvert", false, "Invert steering direction");
             _throttleInv = cfg.Bind("Wheel", "ThrottleInvert", false, "Invert throttle pedal direction");
             _brakeInv = cfg.Bind("Wheel", "BrakeInvert", false, "Invert brake pedal direction");
-            _steerDeadzone = cfg.Bind("Wheel", "SteerDeadzone", 0.02f, "Deadzone at wheel center (0..1)");
-            _pedalDeadzone = cfg.Bind("Wheel", "PedalDeadzone", 0.05f, "Deadzone for pedals (0..1)");
-            _smoothing = cfg.Bind("Wheel", "SmoothingSeconds", 0.15f, "Smoothing window in seconds (lower = snappier)");
+            _steerDeadzone = cfg.Bind("Wheel", "SteerDeadzone", 0.02f, "Steering deadzone at wheel center as a GATE (below it: nothing, above it: untouched linear value)");
+            _pedalDeadzone = cfg.Bind("Wheel", "PedalDeadzone", 0.05f, "Deadzone for pedals (0..1, rescaled/companding)");
+            _smoothing = cfg.Bind("Wheel", "SmoothingSeconds", 0.15f, "Pedal smoothing window in seconds (lower = snappier)");
+            _steerSmooth = cfg.Bind("Wheel", "SteerSmoothingSeconds", 0.05f, "Steering-only smoothing window (lower = snappier, tracks wheel directly)");
+            _centerSnap = cfg.Bind("Wheel", "SteerCenterSnap", 0.015f, "Below this mapped deflection output exactly 0 so the game auto-centers the rudder (kills drift)");
+            _steerCurve = cfg.Bind("Wheel", "SteerCurve", 1f, "Steering linearity exponent (1.0 = linear; 1.5 = softer center, sharper locks)");
+            _directRudder = cfg.Bind("Wheel", "DirectRudder", false, "Postfix overrides rudder angle directly each tick (crisp 1:1, skips the game's easing). Set true if steering still feels laggy/mushy");
             _calKey = cfg.Bind("Wheel", "CalKey", "K", "Keyboard key that advances the steering calibration wizard (A-Z, 0-9)");
             _guiKey = cfg.Bind("Wheel", "DebugKey", "F3", "Keyboard key that toggles the wheel debug overlay (show during calibration regardless)");
 
@@ -600,8 +726,8 @@ namespace BoatMod
 
         private static string CalStatusLine()
         {
-            if (!_calSteerSaved.Value)
-                return "not calibrated - press " + (_calKey?.Value ?? "K") + " to run wizard";
+            if (!_sessionHasCal)
+                return "not calibrated THIS session - press " + (_calKey?.Value ?? "K") + " to run wizard (axis is wrap-around: locks must be taken every boot)";
             return $"cal: center {_calSteerCenter.Value:F3}  L {_calSteerLeft.Value:F3}  R {_calSteerRight.Value:F3}";
         }
 
@@ -609,9 +735,8 @@ namespace BoatMod
         {
             switch (_calStep)
             {
-                case 1: return "STEP 1/3 - HOLD WHEEL CENTERED, press " + (_calKey?.Value ?? "K") + " again when stable";
-                case 2: return "STEP 2/3 - TURN WHEEL FULL LEFT AND HOLD, press " + (_calKey?.Value ?? "K") + " when there";
-                case 3: return "STEP 3/3 - TURN WHEEL FULL RIGHT AND HOLD, press " + (_calKey?.Value ?? "K") + " when there";
+                case 1: return "STEP 1/3 - TURN WHEEL FULL LEFT (against the stop) AND HOLD, press " + (_calKey?.Value ?? "K");
+                case 2: return "STEP 2/3 - TURN WHEEL FULL RIGHT (against the stop) AND HOLD, press " + (_calKey?.Value ?? "K");
                 default: return null;
             }
         }
@@ -626,13 +751,16 @@ namespace BoatMod
             if (_calStep != 0)
             {
                 lines.Add(CalStepText());
-                lines.Add("cal live raw = " + (_device != null && _steer != null ? _steer.ReadValue().ToString("F3") : "?"));
+                lines.Add($"cal: raw {_steer?.ReadValue().ToString("F3") ?? "?"}  unwrapped {_unwrappedSteer:F3}");
+                lines.Add($"wip: L {_wipLeft:F3}  R {_wipRight:F3}  (center auto-derived at the end)");
             }
+            if (!string.IsNullOrEmpty(_calMsg) && Time.unscaledTime < _calMsgUntil)
+                lines.Add(_calMsg);
             else
             {
-                lines.Add($"out: steer {_outSteer:F2}  pedal {_outPedal:F2}  inject={(_injectOn ? "on" : "off")}");
+                lines.Add($"out: steer {_outSteer:F2}  pedal {_outPedal:F2}  inject={(_injectOn ? "on" : "off")}  direct={(_directRudder != null && _directRudder.Value ? "on" : "off")}");
                 if (_device != null && _steer != null && _throttle != null && _brake != null)
-                    lines.Add($"raw: r {_steer.ReadValue():F3}  t {_throttle.ReadValue():F3}  b {_brake.ReadValue():F3}");
+                    lines.Add($"raw: r {_steer.ReadValue():F3} (u {_steer.ReadUnprocessedValue():F3})  w {_unwrappedSteer:F3}  t {_throttle.ReadValue():F3}  b {_brake.ReadValue():F3}");
                 if (_diag != null && _diag.Value)
                     lines.Add("device: " + (_device != null ? (_device.description.product ?? "?") : "?"));
             }
