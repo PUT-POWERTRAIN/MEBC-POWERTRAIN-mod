@@ -8,6 +8,10 @@ integrated into the boat builder, so it can be selected like any native hull.
 Native boat meshes and attachment props (props, motors, rudder, etc.) are hidden
 while the custom model is shown.
 
+Wheel & pedals: MOZA R3 (or any SDL joystick) drives the boat — proportional
+steering (wrap-around axis handled), throttled pedals, wheel buttons trigger the
+Space boost, one-time steering calibration that survives restarts.
+
 ## Features
 
 - Registers `POWERTRAIN POWERBoat` as a native hull in the shop / boat builder.
@@ -33,7 +37,7 @@ while the custom model is shown.
 ## Install (players)
 
 1. Extract the base game to a folder, e.g. `C:\Games\MEBC`.
-2. Extract the contents of `MEBC-PowertrainMod-v1.6.0.zip` **into that same
+2. Extract the contents of `MEBC-PowertrainMod-v1.7.0.zip` **into that same
    folder**, merging/overwriting when prompted. You should end up with:
 
    ```
@@ -103,8 +107,21 @@ in-game.
 | Model | `OffsetX/Y/Z` | `0, -0.32, 0` | Local position offset in meters. |
 | Model | `RotY` | `0` | Yaw rotation in degrees. |
 | Model | `Path` | `BepInEx/plugins/BoatMod/boat.obj` | OBJ file to load (expects a matching `.mtl`). Leave unset to auto-resolve. |
+| Wheel | `Enabled` | `true` | Master switch for wheel/pedals driving. |
+| Wheel | `DeviceName` | `Gudsen` | Substring match for the joystick device (empty = first joystick). |
+| Wheel | `DirectRudder` | `false` | Override the rudder angle directly each tick (crisp 1:1 if stock steering feels laggy). |
 
 Set `Diagnostics = true` for a detailed log of the hull/shop integration.
+
+### Wheel keys (driving with a wheel)
+
+- **`K`** — run the steering wizard: hold FULL left, press `K`, hold FULL right,
+  press `K`. Calibration is saved and survives restarts.
+- **`F3`** — toggle the wheel debug overlay (steering/pedal values, device info).
+- **`L`** — rebind boost buttons: press it, then press the two wheel buttons you
+  want; the first two distinct presses are saved (`Wheel/BoostButtons`).
+- With `BoostButtons` empty, the first two distinct wheel button presses are
+  bound automatically. Bound buttons trigger the same Supercharge boost as Space.
 
 ## Troubleshooting
 
