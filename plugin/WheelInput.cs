@@ -20,6 +20,7 @@ namespace BoatMod
         private static ConfigEntry<float> _steerSmooth, _centerSnap, _steerCurve;
         private static ConfigEntry<bool> _directRudder;
         private static ConfigEntry<string> _calKey;
+        private static ConfigEntry<string> _boostLearnKey;
 
         private static ConfigEntry<bool> _calSteerSaved;
         private static ConfigEntry<float> _calSteerCenter, _calSteerLeft, _calSteerRight;
@@ -98,6 +99,18 @@ namespace BoatMod
         private static bool _tickLogged;
         private static int _lastPumpedFrame = -1;
         private static bool _calLoggedStep;
+
+        private static ConfigEntry<string> _boostButtons;
+        private static readonly List<ButtonControl> _wheelButtons = new List<ButtonControl>();
+        private static readonly List<string> _wheelButtonNames = new List<string>();
+        private static readonly List<string> _wheelButtonPaths = new List<string>();
+        private static readonly List<bool> _wheelButtonLast = new List<bool>();
+        private static readonly List<ButtonControl> _boostCtl = new List<ButtonControl>();
+        private static readonly List<string> _boostNames = new List<string>();
+        private static readonly List<string> _learnPending = new List<string>();
+        private static readonly Dictionary<Type, MethodInfo> _boostMethods = new Dictionary<Type, MethodInfo>();
+        private static object _lastHandler;
+        private static float _boostLastFire;
 
         private static ManualLogSource Log => BoatModPlugin.Log;
 
@@ -184,6 +197,16 @@ namespace BoatMod
                 _guiVisible = !_guiVisible;
                 Log.LogInfo($"[BoatMod] wheel: debug overlay toggled {_guiVisible}");
             }
+            if (KeyDownNow(ParseNamedKey(_boostLearnKey)) && _boostButtons != null)
+            {
+                _boostButtons.Value = "";
+                _cfg?.Save();
+                _boostCtl.Clear();
+                _boostNames.Clear();
+                _learnPending.Clear();
+                CalFeedback("BOOST rebind: press the two wheel buttons now (first two distinct presses are saved)");
+                Log.LogInfo("[BoatMod] wheel: boost binding CLEARED - learn mode armed, press two distinct wheel buttons");
+            }
             if (!_tickLogged)
             {
                 _tickLogged = true;
@@ -240,9 +263,15 @@ namespace BoatMod
                     _captured = false;
                     _steer = _throttle = _brake = null;
                     _injectOn = false;
+                    _wheelButtons.Clear();
+                    _boostCtl.Clear();
+                    _boostNames.Clear();
+                    _learnPending.Clear();
                     return;
                 }
             }
+
+            UpdateButtons();
 
             Vector3 raw;
             float steerUnproc;
@@ -565,6 +594,7 @@ namespace BoatMod
             {
                 var t = __instance.GetType();
                 if (!t.Name.Contains("BoatInput")) return;
+                _lastHandler = __instance;
                 InitInputRefs(t, out var field, out var enableField);
                 if (field == null) return;
                 if (enableField != null && !Equals(true, enableField.GetValue(__instance))) return;
@@ -634,7 +664,168 @@ namespace BoatMod
                 if (_brake == null) missing.Add(_brakeCtl.Value);
                 Log.LogWarning($"[BoatMod] wheel: missing control(s) [{string.Join(", ", missing)}] on '{dev.displayName}'");
             }
+            BuildButtonList(dev);
             DumpControls(dev);
+        }
+
+        private static void BuildButtonList(Joystick dev)
+        {
+            _wheelButtons.Clear();
+            _wheelButtonNames.Clear();
+            _wheelButtonPaths.Clear();
+            _wheelButtonLast.Clear();
+            try
+            {
+                foreach (var c in dev.allControls)
+                {
+                    var b = c as ButtonControl;
+                    if (b == null) continue;
+                    _wheelButtons.Add(b);
+                    _wheelButtonNames.Add(c.name);
+                    _wheelButtonPaths.Add(c.path);
+                    _wheelButtonLast.Add(false);
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[BoatMod] wheel: button scan failed: " + e.Message);
+            }
+            Log.LogInfo($"[BoatMod] wheel: buttons found ({_wheelButtons.Count}): " + string.Join(", ", _wheelButtonNames.ToArray()));
+            InitBoostRuntime();
+        }
+
+        private static void InitBoostRuntime()
+        {
+            _boostCtl.Clear();
+            _boostNames.Clear();
+            _learnPending.Clear();
+            string def = _boostButtons != null ? (_boostButtons.Value ?? "") : "";
+            if (string.IsNullOrEmpty(def.Trim()))
+            {
+                Log.LogInfo("[BoatMod] wheel: boost UNBOUND - learning mode: the first two distinct wheel button presses will be saved and armed");
+                return;
+            }
+            foreach (var rawTok in def.Split(';'))
+            {
+                var name = rawTok.Trim();
+                if (name.Length == 0) continue;
+                int idx = _wheelButtonNames.IndexOf(name);
+                if (idx < 0)
+                {
+                    Log.LogWarning($"[BoatMod] wheel: boost button '{name}' not found on device '{(_device != null ? _device.displayName : "?")}'");
+                    continue;
+                }
+                _boostCtl.Add(_wheelButtons[idx]);
+                _boostNames.Add(name);
+            }
+            if (_boostCtl.Count > 0)
+                Log.LogInfo($"[BoatMod] wheel: boost armed from BoostButtons='{def}': {string.Join(" / ", _boostNames.ToArray())} - each press mirrors the Space Supercharge");
+        }
+
+        private static void UpdateButtons()
+        {
+            try
+            {
+                bool learnMode = _boostCtl.Count == 0 && string.IsNullOrEmpty(_boostButtons.Value.Trim());
+                for (int i = 0; i < _wheelButtons.Count; i++)
+                {
+                    bool up;
+                    try { up = _wheelButtons[i].IsPressed(); }
+                    catch { up = false; }
+                    if (up && !_wheelButtonLast[i]) OnButtonEdge(i, learnMode);
+                    _wheelButtonLast[i] = up;
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[BoatMod] wheel: button poll failed: " + e.Message);
+            }
+        }
+
+        private static void OnButtonEdge(int idx, bool learnMode)
+        {
+            var name = _wheelButtonNames[idx];
+            Log.LogInfo($"[BoatMod] wheel: BUTTON press '{name}' ({_wheelButtonPaths[idx]})");
+            if (learnMode)
+            {
+                if (_learnPending.Contains(name))
+                {
+                    CalFeedback($"boost capture: '{name}' already taken - press a DIFFERENT second button");
+                    return;
+                }
+                _learnPending.Add(name);
+                if (_learnPending.Count >= 2)
+                {
+                    _boostButtons.Value = string.Join(";", _learnPending.ToArray());
+                    _cfg?.Save();
+                    InitBoostRuntime();
+                    CalFeedback($"BOOST SAVED + armed: {_boostButtons.Value} (persists across restarts)");
+                    Log.LogInfo($"[BoatMod] wheel: boost bindings SAVED -> BoostButtons='{_boostButtons.Value}'; both buttons now mirror the Space Supercharge");
+                }
+                else
+                {
+                    CalFeedback($"boost capture: '{name}' taken (1/2) - now press the SECOND button");
+                    Log.LogInfo("[BoatMod] wheel: boost capture 1/2 done - press the SECOND button");
+                }
+                return;
+            }
+            if (_boostNames.Contains(name)) FireBoost(name);
+        }
+
+        private static void FireBoost(string name)
+        {
+            float now = Time.unscaledTime;
+            if (now - _boostLastFire < 0.12f) return;
+            _boostLastFire = now;
+            var handler = ResolveHandlerInstance();
+            if (handler == null)
+            {
+                Log.LogWarning("[BoatMod] wheel: boost pressed but no boat input handler alive yet");
+                return;
+            }
+            var t = handler.GetType();
+            if (!_boostMethods.TryGetValue(t, out var m))
+            {
+                m = t.GetMethod("OnSuperchargerUsed", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+                _boostMethods[t] = m;
+            }
+            if (m == null)
+            {
+                Log.LogWarning("[BoatMod] wheel: boost pressed but OnSuperchargerUsed() not found on " + t.Name);
+                return;
+            }
+            try
+            {
+                object res = m.Invoke(handler, null);
+                bool ok = res is bool b ? b : true;
+                Log.LogInfo($"[BoatMod] wheel: boost '{name}' -> Supercharge {(ok ? "fired" : "REFUSED (battery/disabled)")}");
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[BoatMod] wheel: boost invoke failed: " + e.Message);
+            }
+        }
+
+        private static object ResolveHandlerInstance()
+        {
+            try
+            {
+                var alive = _lastHandler as UnityEngine.Object;
+                if (alive != null) return _lastHandler;
+                foreach (var name in new[] { "BoatInputActionsHandler", "BoatInputHandler" })
+                {
+                    var t = FindType(name);
+                    if (t == null) continue;
+                    var found = UnityEngine.Object.FindObjectOfType(t);
+                    if (found != null)
+                    {
+                        _lastHandler = found;
+                        return found;
+                    }
+                }
+            }
+            catch { }
+            return null;
         }
 
         private static void DumpControls(Joystick dev)
@@ -757,7 +948,9 @@ namespace BoatMod
             _steerCurve = cfg.Bind("Wheel", "SteerCurve", 1f, "Steering linearity exponent (1.0 = linear; 1.5 = softer center, sharper locks)");
             _directRudder = cfg.Bind("Wheel", "DirectRudder", false, "Postfix overrides rudder angle directly each tick (crisp 1:1, skips the game's easing). Set true if steering still feels laggy/mushy");
             _calKey = cfg.Bind("Wheel", "CalKey", "K", "Keyboard key that advances the steering calibration wizard (A-Z, 0-9)");
+            _boostLearnKey = cfg.Bind("Wheel", "BoostLearnKey", "L", "Keyboard key that clears the boost binding and re-enters learn mode (the next two distinct wheel button presses are saved)");
             _guiKey = cfg.Bind("Wheel", "DebugKey", "F3", "Keyboard key that toggles the wheel debug overlay (show during calibration regardless)");
+            _boostButtons = cfg.Bind("Wheel", "BoostButtons", "", "Semicolon-separated wheel button names that mirror the Space Supercharge. Leave EMPTY to learn: the first two distinct button presses on the wheel are saved here automatically");
 
             _calSteerSaved = cfg.Bind("Wheel", "SteerCalibrated", false, "Internal: steering calibration present");
             _calSteerCenter = cfg.Bind("Wheel", "SteerCenter", 0f, "Internal: calibrated steering center (session raw value)");
@@ -777,6 +970,15 @@ namespace BoatMod
                 if (t != null) return t;
             }
             return null;
+        }
+
+        private static string BoostStatusLine()
+        {
+            if (_learnPending.Count > 0)
+                return $"BOOST LEARNING: captured {_learnPending.Count}/2 ({string.Join(" + ", _learnPending.ToArray())}) - press the second button";
+            if (_boostCtl.Count > 0)
+                return "boost: " + string.Join(" / ", _boostNames.ToArray()) + " (mirrors Space; " + (_boostLearnKey?.Value ?? "L") + " to rebind)";
+            return "boost: UNBOUND - press two wheel buttons to bind (first two distinct presses are saved)";
         }
 
         private static string CalStatusLine()
@@ -804,6 +1006,7 @@ namespace BoatMod
             {
                 "[F3] toggle  --  wheel: " + (_device == null ? "(no device yet)" : _device.displayName),
                 CalStatusLine(),
+                BoostStatusLine(),
             };
             if (_calStep != 0)
             {
