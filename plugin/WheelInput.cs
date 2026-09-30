@@ -40,6 +40,19 @@ namespace BoatMod
         private static float _calStartedAt;
         private static float _calSum;
         private static int _calSamples;
+        private static float _calLiveAt;
+        private static float _wipCenter, _wipLeft, _wipRight;
+
+        private static GameObject _guiGO;
+        private static float _nextGuiRecreate;
+        private static bool _guiLoggedAlive;
+
+        private static readonly float[] _ring = new float[64];
+        private static int _ringIdx, _ringCount;
+
+        private static ConfigEntry<bool> _diag;
+        private static ConfigEntry<string> _guiKey;
+        private static bool _guiVisible;
 
         private static float _smSteer, _smThrottle, _smBrake;
         private static float _lastFrame;
@@ -55,6 +68,8 @@ namespace BoatMod
         internal static void BindAndInit(ConfigFile cfg, Harmony harmony)
         {
             BindConfig(cfg);
+            if (_calSteerSaved.Value && Math.Abs(_calSteerCenter.Value) > 0.35f)
+                Log.LogWarning($"[BoatMod] wheel: saved steering center {_calSteerCenter.Value:F3} looks implausible (>0.35) - boat will steer weirdly until recalibrated (press {_calKey.Value})");
             _harmony = harmony;
             int patched = 0;
             foreach (var name in new[] { "BoatInputActionsHandler", "BoatInputHandler" })
@@ -86,6 +101,29 @@ namespace BoatMod
             }
         }
 
+        private static void EnsureGui()
+        {
+            bool alive = _guiGO != null && _guiGO.activeSelf;
+            if (!alive)
+            {
+                float now = Time.unscaledTime;
+                if (_nextGuiRecreate > now) return;
+                _nextGuiRecreate = now + 2f;
+                try
+                {
+                    _guiGO = new GameObject("BoatModWheelGui");
+                    UnityEngine.Object.DontDestroyOnLoad(_guiGO);
+                    _guiGO.AddComponent<WheelGui>();
+                    Log.LogInfo(_guiLoggedAlive ? "[BoatMod] wheel: debug overlay recreated (game had destroyed it)" : $"[BoatMod] wheel: debug overlay ready (toggle {_guiKey.Value}, auto-opens during calibration)");
+                    _guiLoggedAlive = true;
+                }
+                catch (Exception e)
+                {
+                    Log.LogWarning($"[BoatMod] wheel: debug overlay setup failed: {e.Message}");
+                }
+            }
+        }
+
         private static void OnBeforeRenderPump()
         {
             PumpFromHook();
@@ -101,6 +139,11 @@ namespace BoatMod
 
         internal static void Tick()
         {
+            if (KeyDownNow(ParseNamedKey(_guiKey)))
+            {
+                _guiVisible = !_guiVisible;
+                Log.LogInfo($"[BoatMod] wheel: debug overlay toggled {_guiVisible}");
+            }
             if (!_tickLogged)
             {
                 _tickLogged = true;
@@ -116,6 +159,10 @@ namespace BoatMod
                 _calStep = 0;
                 return;
             }
+
+            EnsureGui();
+            EnsureUiText();
+            UpdateUiText();
 
             if (_device == null)
             {
@@ -149,6 +196,7 @@ namespace BoatMod
                 _device = null;
                 _captured = false;
                 _steer = _throttle = _brake = null;
+                _injectOn = false;
                 return;
             }
 
@@ -156,6 +204,10 @@ namespace BoatMod
             _lastFrame = Time.unscaledTime;
             if (dt <= 0f || dt > 0.5f) dt = 0.016f;
             float smooth = Mathf.Clamp01(1f - Mathf.Exp(-dt / Mathf.Max(0.001f, _smoothing.Value)));
+
+            _ring[_ringIdx] = raw.x;
+            _ringIdx = (_ringIdx + 1) % _ring.Length;
+            if (_ringCount < _ring.Length) _ringCount++;
 
             if (HandleCalibration(raw.x)) return;
 
@@ -177,7 +229,7 @@ namespace BoatMod
             _outPedal = Mathf.Clamp(_smThrottle - _smBrake, -1f, 1f);
             _injectOn = true;
 
-            if (BoatModPlugin.Instance != null && BoatModPlugin.Instance.Diag.Value && Time.unscaledTime - _nextDiagLog > 5f)
+            if (_diag != null && _diag.Value && Time.unscaledTime - _nextDiagLog > 5f)
             {
                 _nextDiagLog = Time.unscaledTime;
                 Log.LogInfo($"[BoatMod] wheel: steer={_outSteer:F2} pedal={_outPedal:F2} raw(r={raw.x:F2} t={raw.y:F2} b={raw.z:F2}) ranges(t={_throttleRange:F2} b={_brakeRange:F2})");
@@ -186,42 +238,59 @@ namespace BoatMod
 
         #region Steering calibration
 
-        private static Key? ParseCalKey()
+        private static Key? ParseNamedKey(ConfigEntry<string> entry)
         {
-            if (string.IsNullOrEmpty(_calKey?.Value) || _calKey.Value.Length != 1) return null;
-            char c = char.ToUpperInvariant(_calKey.Value[0]);
-            if (c >= 'A' && c <= 'Z')
-                return (Key)(c - 'A' + 15); // Key enum: A=15 .. Z=40
-            if (c >= '1' && c <= '9')
-                return (Key)(c - '1' + 41); // Digit1=41 .. Digit9=49
-            if (c == '0')
-                return (Key)50;             // Digit0=50
+            var text = entry?.Value;
+            if (string.IsNullOrEmpty(text)) return null;
+            try
+            {
+                if (Enum.TryParse(text, true, out Key parsed)) return parsed;
+            }
+            catch { }
+            if (text.Length == 1)
+            {
+                char c = char.ToUpperInvariant(text[0]);
+                if (c >= 'A' && c <= 'Z') return (Key)(c - 'A' + 15);   // Key enum: A=15 .. Z=40
+                if (c >= '1' && c <= '9') return (Key)(c - '1' + 41);   // Digit1=41 .. Digit9=49
+                if (c == '0') return (Key)50;                            // Digit0=50
+            }
             return null;
+        }
+
+        private static bool KeyDownNow(Key? key)
+        {
+            if (!key.HasValue) return false;
+            try
+            {
+                var kb = Keyboard.current;
+                var btn = kb != null ? kb[key.Value] : null;
+                return btn != null && btn.wasPressedThisFrame;
+            }
+            catch (Exception e)
+            {
+                if (!_calLoggedStep)
+                {
+                    _calLoggedStep = true;
+                    Log.LogWarning($"[BoatMod] wheel: cal key read failed: {e.Message}");
+                }
+                return false;
+            }
         }
 
         private static bool HandleCalibration(float rawSteer)
         {
-            Key? key = ParseCalKey();
-            if (key.HasValue)
-            {
-                try
-                {
-                    var kb = Keyboard.current;
-                    var btn = kb != null ? kb[key.Value] : null;
-                    if (btn != null && btn.wasPressedThisFrame)
-                        NextCalStep();
-                }
-                catch (Exception e)
-                {
-                    if (!_calLoggedStep)
-                    {
-                        _calLoggedStep = true;
-                        Log.LogWarning($"[BoatMod] wheel: cal key read failed: {e.Message}");
-                    }
-                }
-            }
+            if (KeyDownNow(ParseNamedKey(_calKey)))
+                NextCalStep();
 
             if (_calStep == 0) return false;
+
+            float now = Time.unscaledTime;
+            if (now - _calLiveAt > 1f)
+            {
+                _calLiveAt = now;
+                string stepName = _calStep == 1 ? "center-hold" : _calStep == 2 ? "left-hold" : "right-hold";
+                Log.LogInfo($"[BoatMod] wheel: cal ({stepName}) live raw={rawSteer:F3}");
+            }
 
             switch (_calStep)
             {
@@ -232,15 +301,38 @@ namespace BoatMod
                 case 2:
                     _calSum += rawSteer;
                     _calSamples++;
-                    _calSteerLeft.Value = Math.Min(_calSteerLeft.Value, rawSteer);
+                    if (rawSteer < _wipLeft) _wipLeft = rawSteer;
                     return false;
                 case 3:
                     _calSum += rawSteer;
                     _calSamples++;
-                    _calSteerRight.Value = Math.Max(_calSteerRight.Value, rawSteer);
+                    if (rawSteer > _wipRight) _wipRight = rawSteer;
                     return false;
             }
             return false;
+        }
+
+        private static float RingRecent(int n)
+        {
+            n = Math.Min(Math.Min(n, _ringCount), _ring.Length);
+            if (n <= 0) return 0f;
+            float s = 0f;
+            for (int i = 0; i < n; i++) s += _ring[(_ringIdx - 1 - i + _ring.Length * 2) % _ring.Length];
+            return s / n;
+        }
+
+        private static float RingRecentSpread(int n)
+        {
+            n = Math.Min(Math.Min(n, _ringCount), _ring.Length);
+            if (n <= 0) return 0f;
+            float lo = float.MaxValue, hi = float.MinValue;
+            for (int i = 0; i < n; i++)
+            {
+                float v = _ring[(_ringIdx - 1 - i + _ring.Length * 2) % _ring.Length];
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            return hi - lo;
         }
 
         private static void NextCalStep()
@@ -250,6 +342,7 @@ namespace BoatMod
             {
                 case 0:
                     _calStep = 1;
+                    _guiVisible = true;
                     _calStartedAt = now;
                     _calSum = 0f;
                     _calSamples = 0;
@@ -258,13 +351,15 @@ namespace BoatMod
                 case 1:
                     {
                         if (_calSamples < 10) { Log.LogWarning($"[BoatMod] wheel: center sample too short ({_calSamples} frames), press key again"); return; }
-                        _calSteerCenter.Value = _calSum / _calSamples;
+                        float recent = RingRecent(20);
+                        float spread = RingRecentSpread(20);
+                        _wipCenter = recent;
                         _calStep = 2;
                         _calStartedAt = now;
                         _calSum = 0f;
                         _calSamples = 0;
-                        _calSteerLeft.Value = _calSteerCenter.Value;
-                        Log.LogInfo($"[BoatMod] wheel: center = {_calSteerCenter.Value:F3} - step 2/3: TURN WHEEL FULL LEFT AND HOLD, press key again");
+                        _wipLeft = _wipCenter;
+                        Log.LogInfo($"[BoatMod] wheel: center = {_wipCenter:F3} (recent-window of 20, spread {spread:F3}{(spread > 0.2f ? " WARNING: wheel moving during hold" : "")}) - step 2/3: TURN WHEEL FULL LEFT AND HOLD, press key again");
                         break;
                     }
                 case 2:
@@ -274,22 +369,25 @@ namespace BoatMod
                         _calStartedAt = now;
                         _calSum = 0f;
                         _calSamples = 0;
-                        _calSteerRight.Value = _calSteerCenter.Value;
-                        Log.LogInfo($"[BoatMod] wheel: left lock = {_calSteerLeft.Value:F3} (center {_calSteerCenter.Value:F3}) - step 3/3: TURN WHEEL FULL RIGHT AND HOLD, press key again");
+                        _wipRight = _wipCenter;
+                        Log.LogInfo($"[BoatMod] wheel: left lock = {_wipLeft:F3} (center {_wipCenter:F3}) - step 3/3: TURN WHEEL FULL RIGHT AND HOLD, press key again");
                         break;
                     }
                 case 3:
                     {
                         if (_calSamples < 10) { Log.LogWarning($"[BoatMod] wheel: right sample too short, press key again"); return; }
                         _calStep = 0;
-                        if (Math.Abs(_calSteerLeft.Value - _calSteerCenter.Value) < 0.05f || Math.Abs(_calSteerRight.Value - _calSteerCenter.Value) < 0.05f)
+                        _calStartedAt = 0f;
+                        if (Math.Abs(_wipLeft - _wipCenter) < 0.05f || Math.Abs(_wipRight - _wipCenter) < 0.05f)
                         {
-                            Log.LogWarning("[BoatMod] wheel: calibration looks degenerate (locks too close to center), NOT saved");
+                            Log.LogWarning("[BoatMod] wheel: calibration looks degenerate (locks too close to center), NOT saved - previous calibration kept: " + CalStatusLine());
                             break;
                         }
+                        _calSteerCenter.Value = _wipCenter;
+                        _calSteerLeft.Value = _wipLeft;
+                        _calSteerRight.Value = _wipRight;
                         _calSteerSaved.Value = true;
-                        _calStartedAt = 0f;
-                        Log.LogInfo($"[BoatMod] wheel: CALIBRATION COMPLETE - center={_calSteerCenter.Value:F3} left={_calSteerLeft.Value:F3} right={_calSteerRight.Value:F3} (saved to config)");
+                        Log.LogInfo($"[BoatMod] wheel: CALIBRATION COMPLETE - center={_wipCenter:F3} left={_wipLeft:F3} right={_wipRight:F3} (saved to config)");
                         break;
                     }
             }
@@ -345,6 +443,11 @@ namespace BoatMod
                 field.SetValue(__instance, merged);
             }
             catch { }
+        }
+
+        internal static void SetDiag(ConfigEntry<bool> diag)
+        {
+            _diag = diag;
         }
 
         private static void ResolveControls(Joystick dev)
@@ -476,6 +579,7 @@ namespace BoatMod
             _pedalDeadzone = cfg.Bind("Wheel", "PedalDeadzone", 0.05f, "Deadzone for pedals (0..1)");
             _smoothing = cfg.Bind("Wheel", "SmoothingSeconds", 0.15f, "Smoothing window in seconds (lower = snappier)");
             _calKey = cfg.Bind("Wheel", "CalKey", "K", "Keyboard key that advances the steering calibration wizard (A-Z, 0-9)");
+            _guiKey = cfg.Bind("Wheel", "DebugKey", "F3", "Keyboard key that toggles the wheel debug overlay (show during calibration regardless)");
 
             _calSteerSaved = cfg.Bind("Wheel", "SteerCalibrated", false, "Internal: steering calibration present");
             _calSteerCenter = cfg.Bind("Wheel", "SteerCenter", 0f, "Internal: calibrated steering center (raw value)");
@@ -492,6 +596,199 @@ namespace BoatMod
                 if (t != null) return t;
             }
             return null;
+        }
+
+        private static string CalStatusLine()
+        {
+            if (!_calSteerSaved.Value)
+                return "not calibrated - press " + (_calKey?.Value ?? "K") + " to run wizard";
+            return $"cal: center {_calSteerCenter.Value:F3}  L {_calSteerLeft.Value:F3}  R {_calSteerRight.Value:F3}";
+        }
+
+        private static string CalStepText()
+        {
+            switch (_calStep)
+            {
+                case 1: return "STEP 1/3 - HOLD WHEEL CENTERED, press " + (_calKey?.Value ?? "K") + " again when stable";
+                case 2: return "STEP 2/3 - TURN WHEEL FULL LEFT AND HOLD, press " + (_calKey?.Value ?? "K") + " when there";
+                case 3: return "STEP 3/3 - TURN WHEEL FULL RIGHT AND HOLD, press " + (_calKey?.Value ?? "K") + " when there";
+                default: return null;
+            }
+        }
+
+        private static string BuildOverlayText()
+        {
+            var lines = new List<string>
+            {
+                "[F3] toggle  --  wheel: " + (_device == null ? "(no device yet)" : _device.displayName),
+                CalStatusLine(),
+            };
+            if (_calStep != 0)
+            {
+                lines.Add(CalStepText());
+                lines.Add("cal live raw = " + (_device != null && _steer != null ? _steer.ReadValue().ToString("F3") : "?"));
+            }
+            else
+            {
+                lines.Add($"out: steer {_outSteer:F2}  pedal {_outPedal:F2}  inject={(_injectOn ? "on" : "off")}");
+                if (_device != null && _steer != null && _throttle != null && _brake != null)
+                    lines.Add($"raw: r {_steer.ReadValue():F3}  t {_throttle.ReadValue():F3}  b {_brake.ReadValue():F3}");
+                if (_diag != null && _diag.Value)
+                    lines.Add("device: " + (_device != null ? (_device.description.product ?? "?") : "?"));
+            }
+            return string.Join("\n", lines.ToArray());
+        }
+
+        private static Canvas _uiCanvas;
+        private static GameObject _uiPanelGO;
+        private static UnityEngine.UI.Text _uiText;
+        private static TMPro.TextMeshProUGUI _tmpText;
+        private static TMPro.TMP_FontAsset _tmpFont;
+        private static bool _uiTextFailed;
+        private static bool _tmpLogged;
+        private static float _nextUiTry;
+        private static float _nextUiTextUpdate;
+        private static bool _guiFired;
+
+        private static void ResolveTmpFont()
+        {
+            if (_tmpFont != null) return;
+            try
+            {
+                var names = new List<string>();
+                foreach (var f in Resources.FindObjectsOfTypeAll<TMPro.TMP_FontAsset>())
+                {
+                    if (f == null || string.IsNullOrEmpty(f.name)) continue;
+                    names.Add(f.name);
+                    if (_tmpFont == null && f.name.IndexOf("SDF", StringComparison.OrdinalIgnoreCase) >= 0) _tmpFont = f;
+                }
+                if (_tmpFont == null && names.Count > 0)
+                {
+                    foreach (var f in Resources.FindObjectsOfTypeAll<TMPro.TMP_FontAsset>())
+                        if (f != null && !string.IsNullOrEmpty(f.name)) { _tmpFont = f; break; }
+                }
+                if (!_tmpLogged)
+                {
+                    _tmpLogged = true;
+                    Log.LogInfo("[BoatMod] wheel: TMP fonts in memory: " + (names.Count > 0 ? string.Join(", ", names.GetRange(0, Math.Min(10, names.Count)).ToArray()) : "(none!)"));
+                    if (_tmpFont != null) Log.LogInfo($"[BoatMod] wheel: TMP font picked = '{_tmpFont.name}'");
+                    else if (names.Count > 0) Log.LogWarning("[BoatMod] wheel: TMP font not picked despite assets existing");
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[BoatMod] wheel: TMP font scan failed: " + e.Message);
+            }
+        }
+
+        private static void EnsureUiText()
+        {
+            bool want = _guiVisible || _calStep != 0;
+            if (_uiTextFailed || !want) return;
+            if (_nextUiTry > Time.unscaledTime) return;
+            _nextUiTry = Time.unscaledTime + 2f;
+            try
+            {
+                if (_uiPanelGO == null)
+                {
+                    var go = new GameObject("BoatModWheelGuiOverlay");
+                    UnityEngine.Object.DontDestroyOnLoad(go);
+                    var canvas = go.AddComponent<Canvas>();
+                    canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+                    canvas.sortingOrder = 30000;
+
+                    var panelGo = new GameObject("BoatModWheelGuiPanel", typeof(UnityEngine.UI.Image));
+                    panelGo.transform.SetParent(go.transform, false);
+                    var img = panelGo.GetComponent<UnityEngine.UI.Image>();
+                    img.color = new Color(0f, 0f, 0f, 0.7f);
+                    var panelRect = panelGo.GetComponent<RectTransform>();
+                    panelRect.anchorMin = new Vector2(0f, 1f);
+                    panelRect.anchorMax = new Vector2(0f, 1f);
+                    panelRect.pivot = new Vector2(0f, 1f);
+                    panelRect.anchoredPosition = new Vector2(10f, -10f);
+                    panelRect.sizeDelta = new Vector2(520f, 150f);
+
+                    _uiCanvas = canvas;
+                    _uiPanelGO = panelGo;
+                    Log.LogInfo("[BoatMod] wheel: canvas panel created (uGUI)");
+                }
+
+                if (_tmpText == null)
+                {
+                    ResolveTmpFont();
+                    var textGo = new GameObject("BoatModWheelGuiText", typeof(TMPro.TextMeshProUGUI));
+                    textGo.transform.SetParent(_uiPanelGO.transform, false);
+                    var tmp = textGo.GetComponent<TMPro.TextMeshProUGUI>();
+                    tmp.font = _tmpFont;
+                    tmp.fontSize = 20;
+                    tmp.color = Color.white;
+                    tmp.alignment = TMPro.TextAlignmentOptions.TopLeft;
+                    tmp.enableWordWrapping = false;
+                    tmp.overflowMode = TMPro.TextOverflowModes.Overflow;
+                    var txtRect = tmp.rectTransform;
+                    txtRect.anchorMin = new Vector2(0f, 0f);
+                    txtRect.anchorMax = new Vector2(1f, 1f);
+                    txtRect.offsetMin = new Vector2(10f, 6f);
+                    txtRect.offsetMax = new Vector2(-10f, -6f);
+                    _tmpText = tmp;
+                    Log.LogInfo("[BoatMod] wheel: TMP overlay text created (font " + (_tmpFont != null ? _tmpFont.name : "NULL") + ")");
+                }
+            }
+            catch (Exception e)
+            {
+                _uiTextFailed = true;
+                Log.LogWarning($"[BoatMod] wheel: canvas overlay creation failed: {e.Message}");
+            }
+        }
+
+        private static void SetOverlayActive(bool want)
+        {
+            try
+            {
+                if (_uiPanelGO != null) _uiPanelGO.gameObject.SetActive(want);
+                if (_uiText != null) _uiText.gameObject.SetActive(want);
+                if (_tmpText != null) _tmpText.gameObject.SetActive(want);
+            }
+            catch { }
+        }
+
+        private static void UpdateUiText()
+        {
+            bool want = _guiVisible || _calStep != 0;
+            if (!want || _uiPanelGO == null) return;
+            float now = Time.unscaledTime;
+            if (now < _nextUiTextUpdate) return;
+            _nextUiTextUpdate = now + 0.2f;
+            try
+            {
+                var text = BuildOverlayText();
+                if (_tmpText != null) _tmpText.text = text;
+                if (_uiText != null) _uiText.text = text;
+            }
+            catch { }
+        }
+
+        private sealed class WheelGui : MonoBehaviour
+        {
+            public void OnGUI()
+            {
+                try
+                {
+                    if (!_guiFired)
+                    {
+                        _guiFired = true;
+                        Log.LogInfo("[BoatMod] wheel: overlay OnGUI fired (IMGUI path works)");
+                    }
+                    if (_uiPanelGO != null) return;   // canvas renderer owns the visuals once it exists
+                    if (!_guiVisible && _calStep == 0) return;
+                    float top = _calStep != 0 ? 96f : 24f;
+                    var box = new Rect(8f, 8f, 470f, 12f + top);
+                    GUI.Box(box, GUIContent.none);
+                    var label = new Rect(16f, 16f, 454f, box.height - 16f);
+                    GUI.Label(label, BuildOverlayText());
+                }
+                catch { }
+            }
         }
     }
 }

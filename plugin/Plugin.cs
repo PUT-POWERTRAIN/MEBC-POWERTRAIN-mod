@@ -143,6 +143,7 @@ namespace BoatMod
             try
             {
                 WheelInput.BindAndInit(Config, new Harmony(PluginGuid));
+                WheelInput.SetDiag(Diag);
             }
             catch (Exception e)
             {
