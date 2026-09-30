@@ -140,6 +140,14 @@ namespace BoatMod
             }
 
             _timer = 2f;
+            try
+            {
+                WheelInput.BindAndInit(Config, new Harmony(PluginGuid));
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning($"[BoatMod] wheel init failed: {e.Message}");
+            }
             Log.LogInfo("[BoatMod] loaded, scanner running on plugin component");
         }
 
@@ -199,6 +207,7 @@ namespace BoatMod
 
         private static void GameTickHook(object __instance)
         {
+            try { WheelInput.PumpFromHook(); } catch { }
             try
             {
                 var self = Instance;
@@ -215,6 +224,14 @@ namespace BoatMod
 
         private void Update()
         {
+            try
+            {
+                WheelInput.Tick();
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning($"[BoatMod] wheel tick failed: {e.Message}");
+            }
             if (_groups == null || !_enabled.Value) return;
             _timer -= Time.unscaledDeltaTime;
             if (_timer > 0f) return;

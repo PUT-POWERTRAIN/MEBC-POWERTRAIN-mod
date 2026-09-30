@@ -43,6 +43,10 @@
       <HintPath>$(GameDir)/Energy Boat Simulator_Data/Managed/UnityEngine.ParticleSystemModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.InputSystem">
+      <HintPath>$(GameDir)/Energy Boat Simulator_Data/Managed/Unity.InputSystem.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>
