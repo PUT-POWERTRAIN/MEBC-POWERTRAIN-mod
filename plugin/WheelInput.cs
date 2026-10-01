@@ -117,6 +117,7 @@ namespace BoatMod
         private static readonly List<string> _learnPending = new List<string>();
         private static readonly Dictionary<Type, MethodInfo> _boostMethods = new Dictionary<Type, MethodInfo>();
         private static object _lastHandler;
+        private static object _spaceHandler;
         private static float _boostLastFire;
 
         private static ManualLogSource Log => BoatModPlugin.Log;
@@ -143,6 +144,12 @@ namespace BoatMod
                         postfix: new HarmonyMethod(typeof(WheelInput), nameof(MotorInputPostfix)));
                     BoatModPlugin.Log.LogInfo($"[BoatMod] wheel: hooked {name}.FixedUpdate (prefix merge + postfix direct-rudder gated)");
                     patched++;
+                    var sc = t.GetMethod("OnSuperchargerUsed", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(InputAction.CallbackContext) }, null);
+                    if (sc != null && sc.DeclaringType == t)
+                    {
+                        _harmony.Patch(sc, postfix: new HarmonyMethod(typeof(WheelInput), nameof(SuperchargeInputPostfix)));
+                        BoatModPlugin.Log.LogInfo($"[BoatMod] wheel: hooked {name}.OnSuperchargerUsed(InputAction) - wheel boost targets whatever instance handles real Space presses");
+                    }
                 }
                 catch (Exception e)
                 {
@@ -652,10 +659,10 @@ namespace BoatMod
             {
                 var t = __instance.GetType();
                 if (!t.Name.Contains("BoatInput")) return;
-                _lastHandler = __instance;
                 InitInputRefs(t, out var field, out var enableField);
                 if (field == null) return;
                 if (enableField != null && !Equals(true, enableField.GetValue(__instance))) return;
+                _lastHandler = __instance;
                 var current = (Vector2)field.GetValue(__instance);
                 var merged = new Vector2(
                     Mathf.Abs(_outSteer) > 0.001f ? -_outSteer : current.x,
@@ -841,6 +848,7 @@ namespace BoatMod
                 Log.LogWarning("[BoatMod] wheel: boost pressed but no boat input handler alive yet");
                 return;
             }
+            bool driving = HandlerInputEnabled(handler);
             var t = handler.GetType();
             if (!_boostMethods.TryGetValue(t, out var m))
             {
@@ -856,7 +864,29 @@ namespace BoatMod
             {
                 object res = m.Invoke(handler, null);
                 bool ok = res is bool b ? b : true;
-                Log.LogInfo($"[BoatMod] wheel: boost '{name}' -> Supercharge {(ok ? "fired" : "REFUSED (battery/disabled)")}");
+                if (ok)
+                {
+                    Log.LogInfo($"[BoatMod] wheel: boost '{name}' -> {t.Name} supercharge fired");
+                }
+                else
+                {
+                    string why = "unknown gate";
+                    try
+                    {
+                        var sup = t.GetField("_supercharger", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.GetValue(handler);
+                        if (sup == null) why = "no Supercharger component wired on this handler";
+                        else
+                        {
+                            var cc = sup.GetType().GetProperty("ChargeCount")?.GetValue(sup, null);
+                            var seM = t.GetMethod("IsSuperchargerEnabled", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                            var se = seM != null ? seM.Invoke(handler, null) : null;
+                            why = $"charge={(cc ?? (object)"?")} superchargerEnabled={(se ?? (object)"n/a")}";
+                        }
+                    }
+                    catch (Exception ex) { why = "gate check failed: " + ex.Message; }
+                    Log.LogWarning($"[BoatMod] wheel: boost '{name}' REFUSED by {t.Name} (input {(driving ? "on" : "off")}): {why}");
+                    if (driving) CalFeedback("boost refused: " + why);
+                }
             }
             catch (Exception e)
             {
@@ -864,22 +894,76 @@ namespace BoatMod
             }
         }
 
+        private static void SuperchargeInputPostfix(object __instance)
+        {
+            _spaceHandler = __instance;
+        }
+
+        private static bool HandlerInputEnabled(object h)
+        {
+            try
+            {
+                InitInputRefs(h.GetType(), out _, out var enableField);
+                return enableField == null || Equals(true, enableField.GetValue(h));
+            }
+            catch { return false; }
+        }
+
+        private static int HandlerSpaceScore(object h)
+        {
+            try
+            {
+                int score = 0;
+                if (HandlerInputEnabled(h)) score++;
+                var t = h.GetType();
+                var coll = t.GetField("_inputActions", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.GetValue(h);
+                if (coll == null) return score;
+                var player = coll.GetType().GetProperty("Player")?.GetValue(coll, null);
+                var action = player != null ? player.GetType().GetProperty("Supercharge")?.GetValue(player, null) as InputAction : null;
+                if (action != null && action.enabled) score += 2;
+                return score;
+            }
+            catch { return 0; }
+        }
+
         private static object ResolveHandlerInstance()
         {
             try
             {
-                var alive = _lastHandler as UnityEngine.Object;
-                if (alive != null) return _lastHandler;
+                var viaSpace = _spaceHandler as UnityEngine.Object;
+                if (viaSpace != null) return _spaceHandler;
+
+                object best = null, enabled = null;
+                int bestScore = -1;
                 foreach (var name in new[] { "BoatInputActionsHandler", "BoatInputHandler" })
                 {
                     var t = FindType(name);
                     if (t == null) continue;
-                    var found = UnityEngine.Object.FindObjectOfType(t);
-                    if (found != null)
+                    foreach (var found in UnityEngine.Object.FindObjectsOfType(t))
                     {
-                        _lastHandler = found;
-                        return found;
+                        int score = HandlerSpaceScore(found);
+                        if (HandlerInputEnabled(found) && enabled == null) enabled = found;
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            best = found;
+                        }
                     }
+                }
+                if (best != null && bestScore >= 1)
+                {
+                    _lastHandler = best;
+                    return best;
+                }
+                if (enabled != null)
+                {
+                    _lastHandler = enabled;
+                    return enabled;
+                }
+                if (best != null)
+                {
+                    _lastHandler = best;
+                    return best;
                 }
             }
             catch { }
