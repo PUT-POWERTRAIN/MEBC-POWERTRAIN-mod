@@ -69,6 +69,13 @@ namespace BoatMod
         private static float _unwrappedSteer;
         private static bool _unwrapBaselinePending;
         private static float _unwrapBaselineRaw;
+        private static float _prevU;
+        private static float _prevMappedRaw;
+        private static bool _prevMappedValid;
+        private static bool _reanchorArmed;
+        private static float _pinTime;
+        private static float _pinDirSum;
+        private static bool _touchedOnce;
 
         private static void TrackUnwrap(float raw)
         {
@@ -316,6 +323,48 @@ namespace BoatMod
             float steerRaw = _calStep != 0 ? 0f : ComputeSteerSource(steerUnproc);
             if (_steerInv.Value) steerRaw = -steerRaw;
 
+            float duAxis = Math.Abs(steerUnproc - _prevU);
+            if (duAxis > 0.03f) _touchedOnce = true;
+
+            if (_calStep == 0 && !_sessionHasCal && PersistentCalUsable() && _prevMappedValid && _touchedOnce)
+            {
+                if (duAxis < 0.3f && Math.Abs(steerRaw - _prevMappedRaw) > 0.6f && !_reanchorArmed)
+                {
+                    _reanchorArmed = true;
+                    Log.LogWarning("[BoatMod] wheel: steering seam detected away from the lock stop (device axis zero changed since calibration) - hold any FULL lock ~0.5s to re-anchor");
+                    CalFeedback("steering misaligned (device re-zeroed?) - turn to any FULL lock and hold ~0.5s");
+                }
+                if (duAxis < 0.01f)
+                {
+                    _pinTime += dt;
+                    _pinDirSum += steerUnproc - _prevU;
+                    float span = _calSteerRawSpan.Value;
+                    bool spanIsFullTurn = Math.Abs(span - 2f) < 0.02f;
+                    if (_pinTime > 0.35f && _reanchorArmed && (spanIsFullTurn || Math.Abs(_pinDirSum) > 0.15f))
+                    {
+                        float newLeft = spanIsFullTurn || _pinDirSum < 0f
+                            ? WrapCircle(steerUnproc)
+                            : WrapCircle(steerUnproc - span * _calSteerTurnSign.Value);
+                        _calSteerRawLeft.Value = newLeft;
+                        _cfg?.Save();
+                        Log.LogInfo($"[BoatMod] wheel: steering re-anchored at lock stop (raw left {newLeft:F3}, span {span:F2})");
+                        CalFeedback($"steering re-anchored (raw left {newLeft:F3}) - drive on");
+                        _reanchorArmed = false;
+                        _pinTime = 0f;
+                        _pinDirSum = 0f;
+                        _prevMappedValid = false;
+                    }
+                }
+                else
+                {
+                    _pinTime = 0f;
+                    _pinDirSum = 0f;
+                }
+            }
+            _prevMappedRaw = steerRaw;
+            _prevU = steerUnproc;
+            _prevMappedValid = true;
+
             _smSteer += (steerRaw - _smSteer) * steerSmooth;
             _smThrottle += (throttleRaw - _smThrottle) * pedalSmooth;
             _smBrake += (brakeRaw - _smBrake) * pedalSmooth;
@@ -323,6 +372,11 @@ namespace BoatMod
             _outSteer = Mathf.Clamp(_smSteer, -1f, 1f);
             _outPedal = Mathf.Clamp(_smThrottle - _smBrake, -1f, 1f);
             _injectOn = true;
+            if (!_touchedOnce)
+            {
+                _smSteer = 0f;
+                _outSteer = 0f;
+            }
 
             if (_diag != null && _diag.Value && Time.unscaledTime - _nextDiagLog > 5f)
             {
@@ -494,6 +548,10 @@ namespace BoatMod
                         _calSteerRawSpan.Value = _wipRight - _wipLeft;
                         _calSteerTurnSign.Value = _wipRight >= _wipLeft ? 1f : -1f;
                         _cfg?.Save();
+                        _prevMappedValid = false;
+                        _reanchorArmed = false;
+                        _pinTime = 0f;
+                        _pinDirSum = 0f;
                         CalFeedback($"SAVED (persists across restarts): center {_wipCenter:F3} (L {_wipLeft:F3} R {_wipRight:F3}) - go drive!");
                         Log.LogInfo($"[BoatMod] wheel: CALIBRATION COMPLETE - center={_wipCenter:F3} from locks L={_wipLeft:F3} R={_wipRight:F3}; persistent: rawLeft={_calSteerRawLeft.Value:F3} span={_calSteerRawSpan.Value:F2} sign={_calSteerTurnSign.Value:F0}");
                         break;
