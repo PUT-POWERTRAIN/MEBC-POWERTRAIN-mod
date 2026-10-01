@@ -16,11 +16,12 @@ namespace BoatMod
     {
         public const string PluginGuid = "mateusz.energyboatsimulator.custommodel";
         public const string PluginName = "BoatModelSwap";
-        public const string PluginVersion = "1.7.1";
+        public const string PluginVersion = "1.7.2";
 
         internal static ManualLogSource Log;
         internal static BoatModPlugin Instance;
         internal static List<MeshGroup> StaticGroups;
+        internal static bool ModelFallback;
         internal static float s_scale = 1f, s_offX, s_offY, s_offZ, s_rotY;
 
         private ConfigEntry<bool> _enabled;
@@ -50,6 +51,49 @@ namespace BoatMod
             s_rotY = _rotY?.Value ?? 0f;
         }
 
+        private string ResolveModelPath()
+        {
+            var p = _modelPath?.Value;
+            if (string.IsNullOrWhiteSpace(p))
+            {
+                p = Path.Combine(Paths.PluginPath, "BoatMod", "boat.obj");
+                Log.LogInfo($"[BoatMod] Model/Path blank, using default '{p}'");
+            }
+            return p;
+        }
+
+        private static void EnsureModelFilesOnDisk(string objPath)
+        {
+            try
+            {
+                WriteIfMissing(objPath, "BoatMod.boat.obj");
+                WriteIfMissing(Path.ChangeExtension(objPath, ".mtl"), "BoatMod.boat.mtl");
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning($"[BoatMod] model self-heal failed: {e.Message}");
+            }
+        }
+
+        private static void WriteIfMissing(string path, string resName)
+        {
+            try
+            {
+                if (File.Exists(path) && new FileInfo(path).Length > 0) return;
+            }
+            catch { return; }
+
+            var asm = typeof(BoatModPlugin).Assembly;
+            using (var rs = asm.GetManifestResourceStream(resName))
+            {
+                if (rs == null) { Log.LogWarning($"[BoatMod] embedded resource '{resName}' not found"); return; }
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                using (var fs = File.Create(path)) rs.CopyTo(fs);
+            }
+            Log.LogInfo($"[BoatMod] self-heal: wrote '{path}' from embedded resources");
+        }
+
         private void Awake()
         {
             Log = Logger;
@@ -67,28 +111,32 @@ namespace BoatMod
             _rotY = Config.Bind("Model", "RotY", 0f, "Yaw rotation of the model in degrees");
             _modelPath = Config.Bind("Model", "Path",
                 Path.Combine(Paths.PluginPath, "BoatMod", "boat.obj"),
-                "OBJ file to load (expects matching .mtl next to it)");
+                "OBJ file to load (expects matching .mtl next to it). Leave blank for BepInEx/plugins/BoatMod/boat.obj");
 
             CacheModelConfig();
             Config.SettingChanged += (s, e) => CacheModelConfig();
 
             try
             {
-                _groups = ObjLoader.Load(_modelPath.Value, Path.ChangeExtension(_modelPath.Value, ".mtl"), Log);
+                var objPath = ResolveModelPath();
+                EnsureModelFilesOnDisk(objPath);
+                _groups = ObjLoader.Load(objPath, Path.ChangeExtension(objPath, ".mtl"), Log);
             }
             catch (Exception e)
             {
                 Log.LogError($"[BoatMod] failed to load model: {e.Message}");
-                return;
             }
 
-            if (_groups.Count == 0)
+            if (_groups == null || _groups.Count == 0)
             {
-                Log.LogError("[BoatMod] model loaded but contained no geometry");
-                return;
+                Log.LogWarning("[BoatMod] no custom model loaded - continuing without visual swap, hull integration stays enabled");
+                ModelFallback = true;
             }
-            StaticGroups = _groups;
-            Log.LogInfo($"[BoatMod] awake on instance id {GetInstanceID()}");
+            else
+            {
+                StaticGroups = _groups;
+                Log.LogInfo($"[BoatMod] awake on instance id {GetInstanceID()}");
+            }
 
             try
             {

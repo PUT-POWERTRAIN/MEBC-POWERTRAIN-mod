@@ -19,6 +19,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="..\model\boat.obj" LogicalName="BoatMod.boat.obj" />
+    <EmbeddedResource Include="..\model\boat.mtl" LogicalName="BoatMod.boat.mtl" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="BepInEx">
       <HintPath>$(GameDir)/BepInEx/core/BepInEx.dll</HintPath>
       <Private>false</Private>

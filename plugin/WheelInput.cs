@@ -1150,6 +1150,8 @@ namespace BoatMod
                 CalStatusLine(),
                 BoostStatusLine(),
             };
+            if (BoatModPlugin.ModelFallback)
+                lines.Add("model: load failed - using original boat visuals");
             if (_calStep != 0)
             {
                 lines.Add(CalStepText());
