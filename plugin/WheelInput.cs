@@ -33,7 +33,7 @@ namespace BoatMod
         private static readonly Dictionary<Type, FieldInfo> _motorFields = new Dictionary<Type, FieldInfo>();
         private static readonly Dictionary<Type, MethodInfo> _motorSetAngle = new Dictionary<Type, MethodInfo>();
 
-        private static Joystick _device;
+        private static InputDevice _device;
         private static AxisControl _steer, _throttle, _brake;
         private static float _nextDeviceScan;
 
@@ -266,7 +266,7 @@ namespace BoatMod
                 bool present = false;
                 try
                 {
-                    foreach (var d in Joystick.all)
+                    foreach (var d in InputSystem.devices)
                         if (d == _device) { present = true; break; }
                 }
                 catch { }
@@ -716,24 +716,54 @@ namespace BoatMod
             _diag = diag;
         }
 
-        private static void ResolveControls(Joystick dev)
+        private static void ResolveControls(InputDevice dev)
         {
-            _steer = dev.TryGetChildControl<AxisControl>(_steerCtl.Value);
-            _throttle = dev.TryGetChildControl<AxisControl>(_throttleCtl.Value);
-            _brake = dev.TryGetChildControl<AxisControl>(_brakeCtl.Value);
+            _steer = FindAxis(dev, _steerCtl.Value, "steer", new[] { "stick/x", "x" }, null, null);
+            _throttle = FindAxis(dev, _throttleCtl.Value, "throttle", new[] { "z", "trigger", "throttle", "accelerator", "accel", "gas" }, _steer, null);
+            _brake = FindAxis(dev, _brakeCtl.Value, "brake", new[] { "rz", "brake", "brakepedal" }, _steer, _throttle);
             if (_steer == null || _throttle == null || _brake == null)
             {
                 var missing = new List<string>();
                 if (_steer == null) missing.Add(_steerCtl.Value);
                 if (_throttle == null) missing.Add(_throttleCtl.Value);
                 if (_brake == null) missing.Add(_brakeCtl.Value);
-                Log.LogWarning($"[BoatMod] wheel: missing control(s) [{string.Join(", ", missing)}] on '{dev.displayName}'");
+                Log.LogWarning($"[BoatMod] wheel: missing control(s) [{string.Join(", ", missing)}] on '{dev.displayName}' - check the control dump below and set SteerControl/ThrottleControl/BrakeControl in the config");
             }
             BuildButtonList(dev);
             DumpControls(dev);
         }
 
-        private static void BuildButtonList(Joystick dev)
+        private static AxisControl FindAxis(InputDevice dev, string configured, string role, string[] autoNames, AxisControl skipA, AxisControl skipB)
+        {
+            AxisControl byPath = null;
+            try { byPath = dev.TryGetChildControl<AxisControl>(configured); } catch { }
+            if (byPath != null && byPath != skipA && byPath != skipB) return byPath;
+
+            AxisControl byName = null, byAuto = null;
+            try
+            {
+                string want = (configured ?? "").ToLowerInvariant();
+                foreach (var c in dev.allControls)
+                {
+                    var a = c as AxisControl;
+                    if (a == null || a == skipA || a == skipB) continue;
+                    var n = (c.name ?? "").ToLowerInvariant();
+                    var p = c.path ?? "";
+                    var leaf = p.LastIndexOf('/') >= 0 ? p.Substring(p.LastIndexOf('/') + 1).ToLowerInvariant() : p;
+                    if (byName == null && want.Length > 0 && (n == want || leaf == want)) byName = a;
+                    if (byAuto == null)
+                        foreach (var t in autoNames)
+                            if (n == t.ToLowerInvariant() || leaf == t.ToLowerInvariant()) { byAuto = a; break; }
+                }
+            }
+            catch { }
+            var hit = byName ?? byAuto;
+            if (hit != null)
+                Log.LogInfo($"[BoatMod] wheel: {role} axis resolved to '{hit.path}' (configured '{configured}'{(byPath == null ? ", auto-matched" : "")})");
+            return hit;
+        }
+
+        private static void BuildButtonList(InputDevice dev)
         {
             _wheelButtons.Clear();
             _wheelButtonNames.Clear();
@@ -774,7 +804,9 @@ namespace BoatMod
             {
                 var name = rawTok.Trim();
                 if (name.Length == 0) continue;
-                int idx = _wheelButtonNames.IndexOf(name);
+                int idx = -1;
+                for (int i = 0; i < _wheelButtonNames.Count; i++)
+                    if (string.Equals(_wheelButtonNames[i], name, StringComparison.OrdinalIgnoreCase)) { idx = i; break; }
                 if (idx < 0)
                 {
                     Log.LogWarning($"[BoatMod] wheel: boost button '{name}' not found on device '{(_device != null ? _device.displayName : "?")}'");
@@ -970,7 +1002,7 @@ namespace BoatMod
             return null;
         }
 
-        private static void DumpControls(Joystick dev)
+        private static void DumpControls(InputDevice dev)
         {
             try
             {
@@ -984,18 +1016,42 @@ namespace BoatMod
             }
         }
 
-        private static Joystick FindDevice()
+        private static InputDevice FindDevice()
         {
             try
             {
-                var match = _deviceName.Value;
-                foreach (var d in Joystick.all)
+                var match = (_deviceName.Value ?? "").Trim();
+                var autoTokens = new[] { "moza", "gudsen", "racing", "wheel", "r3" };
+                InputDevice fallback = null;
+                foreach (var d in InputSystem.devices)
                 {
-                    if (string.IsNullOrEmpty(match) ||
-                        (d.displayName ?? "").IndexOf(match, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        (d.description.product ?? "").IndexOf(match, StringComparison.OrdinalIgnoreCase) >= 0)
+                    if (d is Keyboard || d is Mouse || d is Touchscreen || d is Gamepad) continue;
+                    bool hasAxis = false;
+                    try { foreach (var c in d.allControls) { if (c is AxisControl) { hasAxis = true; break; } } } catch { }
+                    if (!hasAxis) continue;
+                    var all = (d.displayName ?? "") + " " + (d.description.product ?? "") + " " + (d.description.manufacturer ?? "");
+                    if (match.Length > 0)
+                    {
+                        if (all.IndexOf(match, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            Log.LogInfo($"[BoatMod] wheel: device match '{d.displayName}' (type '{d.GetType().Name}', layout '{d.layout}') via DeviceName='{match}'");
+                            return d;
+                        }
+                        continue;
+                    }
+                    bool autoHit = false;
+                    foreach (var tok in autoTokens)
+                        if (all.IndexOf(tok, StringComparison.OrdinalIgnoreCase) >= 0) { autoHit = true; break; }
+                    if (autoHit)
+                    {
+                        Log.LogInfo($"[BoatMod] wheel: device auto-match '{d.displayName}' (type '{d.GetType().Name}', layout '{d.layout}')");
                         return d;
+                    }
+                    if (fallback == null) fallback = d;
                 }
+                if (fallback != null)
+                    Log.LogInfo($"[BoatMod] wheel: no name match, using first axis device '{fallback.displayName}' (type '{fallback.GetType().Name}', layout '{fallback.layout}')");
+                return fallback;
             }
             catch (Exception e)
             {
@@ -1075,7 +1131,7 @@ namespace BoatMod
         {
             _cfg = cfg;
             _enabled = cfg.Bind("Wheel", "Enabled", true, "Drive the boat with the MOZA R3 wheel/pedals (master switch)");
-            _deviceName = cfg.Bind("Wheel", "DeviceName", "Gudsen", "Substring match for the joystick device (empty = first joystick found)");
+            _deviceName = cfg.Bind("Wheel", "DeviceName", "", "Substring match against device name/product/manufacturer (empty = auto: prefer Moza/Gudsen/wheel-like devices, else first axis device)");
             _steerCtl = cfg.Bind("Wheel", "SteerControl", "stick/x", "Wheel axis control path (see wheel control dump in the log)");
             _throttleCtl = cfg.Bind("Wheel", "ThrottleControl", "z", "Throttle pedal axis control name");
             _brakeCtl = cfg.Bind("Wheel", "BrakeControl", "rz", "Brake pedal axis control name");
