@@ -98,6 +98,10 @@ namespace BoatMod
         private static ConfigEntry<string> _guiKey;
         private static bool _guiVisible;
 
+        private static ConfigEntry<string> _fsKey;
+        private static ConfigEntry<bool> _fsStart;
+        private static int _winW = -1, _winH = -1;
+
         private static float _smSteer, _smThrottle, _smBrake;
         private static float _lastFrame;
         private static float _outSteer, _outPedal;
@@ -221,12 +225,24 @@ namespace BoatMod
                 CalFeedback("BOOST rebind: press the two wheel buttons now (first two distinct presses are saved)");
                 Log.LogInfo("[BoatMod] wheel: boost binding CLEARED - learn mode armed, press two distinct wheel buttons");
             }
+            if (KeyDownNow(ParseNamedKey(_fsKey)))
+                ToggleFullscreen();
             if (!_tickLogged)
             {
                 _tickLogged = true;
                 int devCount = -1;
                 try { devCount = InputSystem.devices.Count; } catch (Exception e) { Log.LogWarning($"[BoatMod] wheel: devices probe failed: {e.Message}"); }
                 Log.LogInfo($"[BoatMod] wheel: Tick alive, enabled={_enabled?.Value.ToString() ?? "null"}, InputSystem.devices={devCount}");
+                try
+                {
+                    if (Screen.fullScreenMode != FullScreenMode.FullScreenWindow)
+                    {
+                        _winW = Screen.width;
+                        _winH = Screen.height;
+                        if (_fsStart != null && _fsStart.Value) ApplyFullscreen(true);
+                    }
+                }
+                catch (Exception e) { Log.LogWarning($"[BoatMod] display: startup mode failed: {e.Message}"); }
             }
             if (_enabled?.Value != true)
             {
@@ -389,6 +405,53 @@ namespace BoatMod
             {
                 _nextDiagLog = Time.unscaledTime;
                 Log.LogInfo($"[BoatMod] wheel: steer={_outSteer:F2} pedal={_outPedal:F2} raw(r={raw.x:F2} u={steerUnproc:F2} w={_unwrappedSteer:F2} t={raw.y:F2} b={raw.z:F2}) ranges(t={_throttleRange:F2} b={_brakeRange:F2})");
+            }
+        }
+
+        private static void ToggleFullscreen()
+        {
+            try
+            {
+                bool goingFull = Screen.fullScreenMode != FullScreenMode.FullScreenWindow;
+                if (goingFull && Screen.width > 0 && Screen.height > 0)
+                {
+                    _winW = Screen.width;
+                    _winH = Screen.height;
+                }
+                ApplyFullscreen(goingFull);
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning($"[BoatMod] display: toggle failed: {e.Message}");
+            }
+        }
+
+        private static void ApplyFullscreen(bool full)
+        {
+            try
+            {
+                var disp = Display.main;
+                if (full)
+                {
+                    Screen.SetResolution(disp.systemWidth, disp.systemHeight, FullScreenMode.FullScreenWindow);
+                    Log.LogInfo($"[BoatMod] display: borderless fullscreen {disp.systemWidth}x{disp.systemHeight} (F11 to undo)");
+                }
+                else
+                {
+                    int w = _winW > 0 ? _winW : disp.systemWidth * 3 / 4;
+                    int h = _winH > 0 ? _winH : disp.systemHeight * 3 / 4;
+                    if (w >= disp.systemWidth || h >= disp.systemHeight)
+                    {
+                        w = disp.systemWidth * 3 / 4;
+                        h = disp.systemHeight * 3 / 4;
+                    }
+                    Screen.SetResolution(w, h, FullScreenMode.Windowed);
+                    Log.LogInfo($"[BoatMod] display: windowed {w}x{h}");
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning($"[BoatMod] display: apply failed: {e.Message}");
             }
         }
 
@@ -1150,6 +1213,9 @@ namespace BoatMod
             _guiKey = cfg.Bind("Wheel", "DebugKey", "F3", "Keyboard key that toggles the wheel debug overlay (show during calibration regardless)");
             _boostButtons = cfg.Bind("Wheel", "BoostButtons", "", "Semicolon-separated wheel button names that mirror the Space Supercharge. Leave EMPTY to learn: the first two distinct button presses on the wheel are saved here automatically");
 
+            _fsKey = cfg.Bind("Display", "FullscreenKey", "F11", "Keyboard key that toggles borderless fullscreen at the monitor's native resolution (Windows Alt+Enter is unreliable in this Unity version)");
+            _fsStart = cfg.Bind("Display", "StartFullscreen", false, "Start the game in borderless fullscreen at monitor resolution");
+
             _calSteerSaved = cfg.Bind("Wheel", "SteerCalibrated", false, "Internal: steering calibration present");
             _calSteerCenter = cfg.Bind("Wheel", "SteerCenter", 0f, "Internal: calibrated steering center (session raw value)");
             _calSteerLeft = cfg.Bind("Wheel", "SteerLeft", 0f, "Internal: full LEFT lock raw value");
@@ -1202,7 +1268,7 @@ namespace BoatMod
         {
             var lines = new List<string>
             {
-                "[F3] toggle  --  wheel: " + (_device == null ? "(no device yet)" : _device.displayName),
+                "[F3] toggle  [F11] fullscreen  --  wheel: " + (_device == null ? "(no device yet)" : _device.displayName),
                 CalStatusLine(),
                 BoostStatusLine(),
             };
