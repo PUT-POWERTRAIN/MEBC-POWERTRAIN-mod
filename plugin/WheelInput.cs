@@ -457,7 +457,7 @@ namespace BoatMod
 
         #region Steering calibration
 
-        private static Key? ParseNamedKey(ConfigEntry<string> entry)
+        internal static Key? ParseNamedKey(ConfigEntry<string> entry)
         {
             var text = entry?.Value;
             if (string.IsNullOrEmpty(text)) return null;
@@ -476,7 +476,7 @@ namespace BoatMod
             return null;
         }
 
-        private static bool KeyDownNow(Key? key)
+        internal static bool KeyDownNow(Key? key)
         {
             if (!key.HasValue) return false;
             try
@@ -1271,6 +1271,7 @@ namespace BoatMod
                 "[F3] toggle  [F11] fullscreen  --  wheel: " + (_device == null ? "(no device yet)" : _device.displayName),
                 CalStatusLine(),
                 BoostStatusLine(),
+                FossenPhysics.StatusLine(),
             };
             if (BoatModPlugin.ModelFallback)
                 lines.Add("model: load failed - using original boat visuals");
