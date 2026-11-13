@@ -9,8 +9,9 @@ Native boat meshes and attachment props (props, motors, rudder, etc.) are hidden
 while the custom model is shown.
 
 Wheel & pedals: MOZA R3 (or any SDL joystick) drives the boat — proportional
-steering (wrap-around axis handled), throttled pedals, wheel buttons trigger the
-Space boost, one-time steering calibration that survives restarts.
+steering (wrap-around axis handled, automatic axis/centre detection, no setup
+needed), throttled pedals, wheel buttons trigger the Space boost, optional
+one-time steering calibration that survives restarts.
 
 ## Features
 
@@ -37,7 +38,7 @@ Space boost, one-time steering calibration that survives restarts.
 ## Install (players)
 
 1. Extract the base game to a folder, e.g. `C:\Games\MEBC`.
-2. Extract the contents of `MEBC-PowertrainMod-v1.8.0.zip` **into that same
+2. Extract the contents of `MEBC-PowertrainMod-v1.8.1.zip` **into that same
    folder**, merging/overwriting when prompted. You should end up with:
 
    ```
@@ -108,16 +109,23 @@ in-game.
 | Model | `RotY` | `0` | Yaw rotation in degrees. |
 | Model | `Path` | `BepInEx/plugins/BoatMod/boat.obj` | OBJ file to load (expects a matching `.mtl`). Leave unset to auto-resolve. |
 | Wheel | `Enabled` | `true` | Master switch for wheel/pedals driving. |
-| Wheel | `DeviceName` | `Gudsen` | Substring match for the joystick device (empty = first joystick). |
+| Wheel | `DeviceName` | *(empty)* | Substring match for the wheel device. Empty = auto (prefer MOZA/Gudsen/wheel-like devices). |
+| Wheel | `SteerControl` | `stick/x` | Steering axis path/name. Empty or wrong is auto-resolved (`stick/x`, `x`, `wheel`, `rx`, `ry`) and movement-learning takes over if needed. |
 | Wheel | `DirectRudder` | `false` | Override the rudder angle directly each tick (crisp 1:1 if stock steering feels laggy). |
 
 Set `Diagnostics = true` for a detailed log of the hull/shop integration.
 
 ### Wheel keys (driving with a wheel)
 
-- **`K`** — run the steering wizard: hold FULL left, press `K`, hold FULL right,
-  press `K`. Calibration is saved and survives restarts.
-- **`F3`** — toggle the wheel debug overlay (steering/pedal values, device info).
+- Steering works without setup: if no calibration exists, the wheel's own centre
+  and range are used. The mod also learns the steering axis from movement, so
+  Windows HID layouts that name the axis `wheel`/`rx`/`ry` instead of `stick/x`
+  work too.
+- **`K`** — optional steering wizard: hold FULL left, press `K`, hold FULL right,
+  press `K`. Calibration is saved, survives restarts, and is tied to the wheel
+  device/axis (a calibration copied from another PC is ignored).
+- **`F3`** — toggle the wheel debug overlay (steering/pedal values, resolved
+  axis, device info).
 - **`L`** — rebind boost buttons: press it, then press the two wheel buttons you
   want; the first two distinct presses are saved (`Wheel/BoostButtons`).
 - With `BoostButtons` empty, the first two distinct wheel button presses are
@@ -131,6 +139,10 @@ Set `Diagnostics = true` for a detailed log of the hull/shop integration.
 - **Hull missing from the shop** — check `BepInEx/LogOutput.log` for
   `POWERTRAIN`; enable `Diagnostics` for more detail.
 - **Boat misplaced or too big/small** — adjust `OffsetY`, `Scale` and `RotY`.
+- **Pedals work but the wheel does not steer** — press `F3`: the overlay shows
+  the resolved `axis:`. Turn the wheel once and the mod auto-binds the axis that
+  actually moves. If it still looks wrong, press `K` and run the full-left /
+  full-right wizard. Check `BepInEx/LogOutput.log` for `wheel:` lines.
 - **Crash / black boat** — verify `boat.obj` and `boat.mtl` are both present in
   `BepInEx/plugins/BoatMod/`.
 

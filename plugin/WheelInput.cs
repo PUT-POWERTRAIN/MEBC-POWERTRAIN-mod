@@ -25,6 +25,7 @@ namespace BoatMod
         private static ConfigEntry<bool> _calSteerSaved;
         private static ConfigEntry<float> _calSteerCenter, _calSteerLeft, _calSteerRight;
         private static ConfigEntry<float> _calSteerRawLeft, _calSteerRawSpan, _calSteerTurnSign;
+        private static ConfigEntry<string> _calSteerDevice;
 
         private static Harmony _harmony;
         private static readonly Dictionary<Type, FieldInfo> _motorInputFields = new Dictionary<Type, FieldInfo>();
@@ -76,6 +77,15 @@ namespace BoatMod
         private static float _pinTime;
         private static float _pinDirSum;
         private static bool _touchedOnce;
+        private static bool _steerConfirmed;
+        private static bool _calDeviceMatches = true;
+        private static float _restSteer;
+
+        private static readonly List<InputDevice> _axisDevices = new List<InputDevice>();
+        private static readonly List<AxisControl> _probeAxes = new List<AxisControl>();
+        private static readonly List<float> _probeMin = new List<float>();
+        private static readonly List<float> _probeMax = new List<float>();
+        private static bool _probeLogged;
 
         private static void TrackUnwrap(float raw)
         {
@@ -92,6 +102,7 @@ namespace BoatMod
             _unwrapBaselineRaw = raw;
             _unwrappedSteer = 0f;
             _unwrapBaselinePending = false;
+            _prevU = raw;   // don't treat the first read as wheel movement
         }
 
         private static ConfigEntry<bool> _diag;
@@ -129,6 +140,7 @@ namespace BoatMod
         internal static void BindAndInit(ConfigFile cfg, Harmony harmony)
         {
             BindConfig(cfg);
+            DiscardBundledCalibration();
             if (_calSteerSaved.Value && !PersistentCalUsable() && Math.Abs(_calSteerCenter.Value) > 0.35f)
                 Log.LogWarning($"[BoatMod] wheel: old-format calibration has implausible center {_calSteerCenter.Value:F3} (>0.35) - press {_calKey.Value} once to regenerate persistent calibration");
             if (_calSteerSaved.Value && PersistentCalUsable())
@@ -250,6 +262,8 @@ namespace BoatMod
                 _device = null;
                 _captured = false;
                 _calStep = 0;
+                _steerConfirmed = false;
+                ResetProbe();
                 return;
             }
 
@@ -293,6 +307,9 @@ namespace BoatMod
                     _captured = false;
                     _steer = _throttle = _brake = null;
                     _injectOn = false;
+                    _steerConfirmed = false;
+                    _calDeviceMatches = true;
+                    ResetProbe();
                     _wheelButtons.Clear();
                     _boostCtl.Clear();
                     _boostNames.Clear();
@@ -302,6 +319,7 @@ namespace BoatMod
             }
 
             UpdateButtons();
+            ProbeSteerAxis();
 
             Vector3 raw;
             float steerUnproc;
@@ -321,6 +339,7 @@ namespace BoatMod
                 _captured = false;
                 _steer = _throttle = _brake = null;
                 _injectOn = false;
+                ResetProbe();
                 return;
             }
 
@@ -562,6 +581,10 @@ namespace BoatMod
                     _calStep = 1;
                     _guiVisible = true;
                     _calStartedAt = now;
+                    // Let the axis probe help if SteerControl/auto-detect picked the
+                    // wrong Windows HID axis: the user is about to turn full lock.
+                    BeginSteerProbe();
+                    _steerConfirmed = false;
                     _calSum = 0f;
                     _calSamples = 0;
                     _wipLeft = 10f;
@@ -617,6 +640,9 @@ namespace BoatMod
                         _calSteerRawLeft.Value = WrapCircle(_wipLeft + _unwrapBaselineRaw);
                         _calSteerRawSpan.Value = _wipRight - _wipLeft;
                         _calSteerTurnSign.Value = _wipRight >= _wipLeft ? 1f : -1f;
+                        _calSteerDevice.Value = SteerFingerprint();
+                        _calDeviceMatches = true;
+                        _steerConfirmed = true;
                         _cfg?.Save();
                         _prevMappedValid = false;
                         _reanchorArmed = false;
@@ -636,7 +662,56 @@ namespace BoatMod
         {
             return _calSteerSaved != null && _calSteerSaved.Value
                 && _calSteerRawSpan.Value > 0.3f && _calSteerRawSpan.Value <= 2.05f
-                && Math.Abs(_calSteerTurnSign.Value) > 0.5f;
+                && Math.Abs(_calSteerTurnSign.Value) > 0.5f
+                && _calDeviceMatches;
+        }
+
+        private static void DiscardBundledCalibration()
+        {
+            if (_calSteerSaved == null || !_calSteerSaved.Value) return;
+            if (!string.IsNullOrEmpty((_calSteerDevice?.Value ?? "").Trim())) return;
+
+            // Every release pack shipped the developer's own R3 calibration in the
+            // default config (SteerCalibrated=true). On another wheel / another OS
+            // it maps the wheel wrongly (or makes it look dead), so drop exactly
+            // that known-bad block once and let the default mapping take over.
+            bool bundled =
+                Math.Abs(_calSteerCenter.Value + 0.005951017f) < 0.002f &&
+                Math.Abs(_calSteerLeft.Value + 1.005936f) < 0.002f &&
+                Math.Abs(_calSteerRight.Value - 0.9940338f) < 0.002f &&
+                Math.Abs(_calSteerRawLeft.Value - 1.525879e-05f) < 0.001f &&
+                Math.Abs(_calSteerRawSpan.Value - 1.999969f) < 0.002f &&
+                Math.Abs(_calSteerTurnSign.Value - 1f) < 0.01f;
+            if (!bundled) return;
+
+            _calSteerSaved.Value = false;
+            _cfg?.Save();
+            Log.LogWarning("[BoatMod] wheel: bundled development calibration found in config - discarded; using automatic steering mapping (press K to calibrate)");
+        }
+
+        private static string SteerFingerprint()
+        {
+            try
+            {
+                var dev = _steer != null ? _steer.device : _device;
+                return ((dev != null ? dev.layout.ToString() : "") + "|" +
+                        (dev != null ? (dev.description.product ?? dev.displayName ?? "") : "") + "|" +
+                        (_steer != null ? _steer.path : "")).ToLowerInvariant();
+            }
+            catch { return ""; }
+        }
+
+        private static void ValidateCalibrationDevice()
+        {
+            string saved = (_calSteerDevice?.Value ?? "").Trim();
+            if (saved.Length == 0)
+            {
+                _calDeviceMatches = true;   // pre-fingerprint calibration: trust it
+                return;
+            }
+            _calDeviceMatches = string.Equals(saved, SteerFingerprint(), StringComparison.OrdinalIgnoreCase);
+            if (!_calDeviceMatches && _calSteerSaved != null && _calSteerSaved.Value)
+                Log.LogWarning($"[BoatMod] wheel: saved steering calibration belongs to a different device/axis ('{saved}') - ignoring it; using automatic mapping (press {_calKey.Value} to recalibrate)");
         }
 
         private static float ComputeSteerSource(float steerUnprocRaw)
@@ -645,7 +720,45 @@ namespace BoatMod
                 return ShapeSteer(SteerUnwrappedToOut(_unwrappedSteer));
             if (PersistentCalUsable())
                 return ShapeSteer(PersistentSteer(steerUnprocRaw));
-            return 0f;
+            // No (usable) calibration: fall back to the axis' own centre/range so the
+            // wheel still steers out of the box. The K wizard refines this later.
+            return ShapeSteer(DefaultSteer(steerUnprocRaw));
+        }
+
+        private static void AxisRange(AxisControl a, out float lo, out float hi, out float center)
+        {
+            lo = -1f; hi = 1f; center = 0f;
+            if (a is ButtonControl)
+            {
+                lo = 0f; hi = 1f; center = 0.5f;
+            }
+            else if (a != null && a.normalize && a.normalizeMax > a.normalizeMin)
+            {
+                // AxisControl normalizes to -1..1 when zero is inside the range,
+                // otherwise to 0..1 (and invert flips that). This is the actual
+                // range ReadUnprocessedValue() returns.
+                if (a.normalizeMin < a.normalizeZero)
+                {
+                    lo = -1f; hi = 1f; center = 0f;
+                }
+                else if (a.invert)
+                {
+                    lo = -1f; hi = 0f; center = -0.5f;
+                }
+                else
+                {
+                    lo = 0f; hi = 1f; center = 0.5f;
+                }
+            }
+        }
+
+        private static float DefaultSteer(float raw)
+        {
+            float lo, hi, center;
+            AxisRange(_steer, out lo, out hi, out center);
+            float half = Mathf.Max(center - lo, hi - center);
+            if (half < 0.05f) return 0f;
+            return Mathf.Clamp((raw - center) / half, -1f, 1f);
         }
 
         private static float SteerUnwrappedToOut(float raw)
@@ -781,9 +894,32 @@ namespace BoatMod
 
         private static void ResolveControls(InputDevice dev)
         {
-            _steer = FindAxis(dev, _steerCtl.Value, "steer", new[] { "stick/x", "x" }, null, null);
-            _throttle = FindAxis(dev, _throttleCtl.Value, "throttle", new[] { "z", "trigger", "throttle", "accelerator", "accel", "gas" }, _steer, null);
-            _brake = FindAxis(dev, _brakeCtl.Value, "brake", new[] { "rz", "brake", "brakepedal" }, _steer, _throttle);
+            // Windows HID layouts do not always expose the wheel as "stick/x":
+            // depending on firmware/driver it can be a top-level X, the standard
+            // HID "Wheel" usage, or a rotation axis (RX/RY). Accept all of them.
+            _steer = FindAxis(dev, _steerCtl.Value, "steer", new[] { "stick/x", "x", "wheel", "rx", "ry" }, null, null);
+            _throttle = FindAxis(dev, _throttleCtl.Value, "throttle", new[] { "z", "trigger", "righttrigger", "throttle", "accelerator", "accel", "gas" }, _steer, null);
+            _brake = FindAxis(dev, _brakeCtl.Value, "brake", new[] { "rz", "lefttrigger", "brake", "brakepedal" }, _steer, _throttle);
+
+            // Some Windows drivers split the base and the pedals into separate HID
+            // devices. Resolve any missing role on the other axis devices too.
+            if (_steer == null || _throttle == null || _brake == null)
+            {
+                foreach (var other in _axisDevices)
+                {
+                    if (other == dev) continue;
+                    if (_steer == null)
+                    {
+                        var found = FindAxis(other, _steerCtl.Value, "steer", new[] { "stick/x", "x", "wheel", "rx", "ry" }, null, null);
+                        if (found != null) { _steer = found; _device = other; }
+                    }
+                    if (_throttle == null)
+                        _throttle = FindAxis(other, _throttleCtl.Value, "throttle", new[] { "z", "trigger", "righttrigger", "throttle", "accelerator", "accel", "gas" }, _steer, null);
+                    if (_brake == null)
+                        _brake = FindAxis(other, _brakeCtl.Value, "brake", new[] { "rz", "lefttrigger", "brake", "brakepedal" }, _steer, _throttle);
+                    if (_steer != null && _throttle != null && _brake != null) break;
+                }
+            }
             if (_steer == null || _throttle == null || _brake == null)
             {
                 var missing = new List<string>();
@@ -792,7 +928,9 @@ namespace BoatMod
                 if (_brake == null) missing.Add(_brakeCtl.Value);
                 Log.LogWarning($"[BoatMod] wheel: missing control(s) [{string.Join(", ", missing)}] on '{dev.displayName}' - check the control dump below and set SteerControl/ThrottleControl/BrakeControl in the config");
             }
-            BuildButtonList(dev);
+            ValidateCalibrationDevice();
+            BeginSteerProbe();
+            BuildButtonList(_device ?? dev);
             DumpControls(dev);
         }
 
@@ -805,25 +943,182 @@ namespace BoatMod
             AxisControl byName = null, byAuto = null;
             try
             {
-                string want = (configured ?? "").ToLowerInvariant();
+                string want = (configured ?? "").Trim().ToLowerInvariant();
                 foreach (var c in dev.allControls)
                 {
                     var a = c as AxisControl;
                     if (a == null || a == skipA || a == skipB) continue;
+                    if (a is UnityEngine.InputSystem.Controls.DpadControl.DpadAxisControl) continue;
                     var n = (c.name ?? "").ToLowerInvariant();
-                    var p = c.path ?? "";
-                    var leaf = p.LastIndexOf('/') >= 0 ? p.Substring(p.LastIndexOf('/') + 1).ToLowerInvariant() : p;
+                    var p = (c.path ?? "").ToLowerInvariant();
+                    var leaf = p.LastIndexOf('/') >= 0 ? p.Substring(p.LastIndexOf('/') + 1) : p;
+                    // configured may be a full leaf ("stick/x") or just a name ("x")
+                    if (byPath == null && want.Length > 0 &&
+                        (p == want || p.EndsWith("/" + want, StringComparison.Ordinal) || n == want || leaf == want))
+                        byPath = a;
                     if (byName == null && want.Length > 0 && (n == want || leaf == want)) byName = a;
                     if (byAuto == null)
                         foreach (var t in autoNames)
-                            if (n == t.ToLowerInvariant() || leaf == t.ToLowerInvariant()) { byAuto = a; break; }
+                        {
+                            string tok = t.ToLowerInvariant();
+                            if (n == tok || leaf == tok || p.EndsWith("/" + tok, StringComparison.Ordinal)) { byAuto = a; break; }
+                        }
                 }
             }
             catch { }
-            var hit = byName ?? byAuto;
+            var hit = byPath ?? byName ?? byAuto;
             if (hit != null)
-                Log.LogInfo($"[BoatMod] wheel: {role} axis resolved to '{hit.path}' (configured '{configured}'{(byPath == null ? ", auto-matched" : "")})");
+                Log.LogInfo($"[BoatMod] wheel: {role} axis resolved to '{hit.path}' on '{dev.displayName}' (configured '{configured}'{(byPath == null ? ", auto-matched" : "")})");
             return hit;
+        }
+
+        private static void BeginSteerProbe()
+        {
+            _probeAxes.Clear();
+            _probeMin.Clear();
+            _probeMax.Clear();
+            _steerConfirmed = PersistentCalUsable();
+            try
+            {
+                var devices = new List<InputDevice>();
+                if (_device != null) devices.Add(_device);
+                foreach (var d in _axisDevices)
+                    if (d != _device && !(d is Gamepad)) devices.Add(d);
+
+                foreach (var d in devices)
+                {
+                    foreach (var c in d.allControls)
+                    {
+                        var a = c as AxisControl;
+                        if (a == null) continue;
+                        if (a == _throttle || a == _brake) continue;
+                        if (a is ButtonControl || a is UnityEngine.InputSystem.Controls.DpadControl.DpadAxisControl) continue;   // triggers/hats, not steering
+                        _probeAxes.Add(a);
+                        _probeMin.Add(float.MaxValue);
+                        _probeMax.Add(float.MinValue);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[BoatMod] wheel: steering probe setup failed: " + e.Message);
+            }
+            if (!_probeLogged)
+            {
+                _probeLogged = true;
+                Log.LogInfo($"[BoatMod] wheel: watching {_probeAxes.Count} axis candidate(s) for steering movement");
+            }
+        }
+
+        private static void ResetProbe()
+        {
+            _probeAxes.Clear();
+            _probeMin.Clear();
+            _probeMax.Clear();
+            _steerConfirmed = false;
+        }
+
+        private static void ProbeSteerAxis()
+        {
+            if (_steerConfirmed || _probeAxes.Count == 0) return;
+            try
+            {
+                float currentRange = 0f;
+                int best = -1;
+                float bestRange = 0f, bestValue = 0f;
+                for (int i = 0; i < _probeAxes.Count; i++)
+                {
+                    float v;
+                    try { v = _probeAxes[i].ReadUnprocessedValue(); }
+                    catch { continue; }
+                    if (v < _probeMin[i]) _probeMin[i] = v;
+                    if (v > _probeMax[i]) _probeMax[i] = v;
+                    float range = _probeMax[i] - _probeMin[i];
+                    if (_probeAxes[i] == _steer) currentRange = range;
+                    if (range > bestRange) { bestRange = range; best = i; bestValue = v; }
+                }
+
+                if (currentRange >= 0.05f)
+                {
+                    _steerConfirmed = true;
+                    if (_steer != null)
+                        Log.LogInfo($"[BoatMod] wheel: steering axis '{_steer.path}' confirmed by movement");
+                    return;
+                }
+                if (best < 0) return;
+
+                var candidate = _probeAxes[best];
+                if (candidate == null || candidate == _steer) return;
+
+                bool steerName = IsSteerName(candidate);
+                float need = steerName ? 0.08f : 0.2f;
+                if (bestRange < need) return;
+
+                // If something is already bound, only replace it with an axis the
+                // user swept through its centre (both directions), or with a clearly
+                // steering-named axis (x / wheel / rx / ry) after a one-way sweep.
+                // This keeps a clutch/handbrake axis from stealing steering.
+                if (_steer != null && !(steerName && bestRange > 0.12f))
+                {
+                    float clo, chi, ccenter;
+                    AxisRange(candidate, out clo, out chi, out ccenter);
+                    if (!(_probeMin[best] < ccenter - 0.08f && _probeMax[best] > ccenter + 0.08f))
+                        return;
+                }
+                SwitchSteerAxis(candidate, bestValue);
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[BoatMod] wheel: steering probe failed: " + e.Message);
+                _steerConfirmed = true;   // don't spam / fight real input
+            }
+        }
+
+        private static bool IsSteerName(AxisControl a)
+        {
+            try
+            {
+                string n = (a.name ?? "").ToLowerInvariant();
+                string p = (a.path ?? "").ToLowerInvariant();
+                string leaf = p.LastIndexOf('/') >= 0 ? p.Substring(p.LastIndexOf('/') + 1) : p;
+                return n == "x" || leaf == "x" ||
+                       n == "wheel" || leaf == "wheel" ||
+                       n == "rx" || leaf == "rx" ||
+                       n == "ry" || leaf == "ry" ||
+                       n.IndexOf("steer", StringComparison.Ordinal) >= 0;
+            }
+            catch { return false; }
+        }
+
+        private static void SwitchSteerAxis(AxisControl axis, float value)
+        {
+            if (axis == null || axis == _steer) return;
+            string oldPath = _steer != null ? _steer.path : "(none)";
+            Log.LogWarning($"[BoatMod] wheel: auto-detected steering axis '{axis.path}' on '{axis.device?.displayName ?? "?"}' (was '{oldPath}')");
+            _steer = axis;
+            _restSteer = value;
+            _unwrapBaselinePending = false;
+            ResetUnwrapBaseline(value);
+            _prevMappedValid = false;
+            _reanchorArmed = false;
+            _pinTime = 0f;
+            _pinDirSum = 0f;
+            _touchedOnce = true;
+            _steerConfirmed = true;
+            _smSteer = 0f;
+            _outSteer = 0f;
+            if (_calStep != 0)
+            {
+                _calStep = 0;
+                CalFeedback("steering axis auto-detected - press K to run the calibration wizard again");
+            }
+            if (_calSteerSaved != null && _calSteerSaved.Value && string.IsNullOrEmpty((_calSteerDevice?.Value ?? "").Trim()))
+                _calDeviceMatches = false;   // old calibration was taken on a different axis
+            if (axis.device != null && axis.device != _device)
+            {
+                _device = axis.device;
+                BuildButtonList(_device);
+            }
         }
 
         private static void BuildButtonList(InputDevice dev)
@@ -1085,36 +1380,40 @@ namespace BoatMod
             {
                 var match = (_deviceName.Value ?? "").Trim();
                 var autoTokens = new[] { "moza", "gudsen", "racing", "wheel", "r3" };
-                InputDevice fallback = null;
+                InputDevice named = null, auto = null, fallback = null;
+                _axisDevices.Clear();
                 foreach (var d in InputSystem.devices)
                 {
-                    if (d is Keyboard || d is Mouse || d is Touchscreen || d is Gamepad) continue;
+                    if (d is Keyboard || d is Mouse || d is Touchscreen) continue;
                     bool hasAxis = false;
-                    try { foreach (var c in d.allControls) { if (c is AxisControl) { hasAxis = true; break; } } } catch { }
+                    try { foreach (var c in d.allControls) { if (c is AxisControl && !(c is ButtonControl)) { hasAxis = true; break; } } } catch { }
                     if (!hasAxis) continue;
+                    _axisDevices.Add(d);
+
                     var all = (d.displayName ?? "") + " " + (d.description.product ?? "") + " " + (d.description.manufacturer ?? "");
                     if (match.Length > 0)
                     {
-                        if (all.IndexOf(match, StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            Log.LogInfo($"[BoatMod] wheel: device match '{d.displayName}' (type '{d.GetType().Name}', layout '{d.layout}') via DeviceName='{match}'");
-                            return d;
-                        }
+                        if (named == null && all.IndexOf(match, StringComparison.OrdinalIgnoreCase) >= 0)
+                            named = d;
                         continue;
                     }
                     bool autoHit = false;
                     foreach (var tok in autoTokens)
                         if (all.IndexOf(tok, StringComparison.OrdinalIgnoreCase) >= 0) { autoHit = true; break; }
-                    if (autoHit)
-                    {
-                        Log.LogInfo($"[BoatMod] wheel: device auto-match '{d.displayName}' (type '{d.GetType().Name}', layout '{d.layout}')");
-                        return d;
-                    }
-                    if (fallback == null) fallback = d;
+                    if (autoHit && auto == null) auto = d;
+                    // A wheel in Xbox-compatible mode enumerates as a Gamepad. It is
+                    // fine when it matches a wheel name above, but don't grab a random
+                    // gamepad over a real joystick wheel in the generic fallback.
+                    if (!(d is Gamepad) && fallback == null) fallback = d;
                 }
-                if (fallback != null)
-                    Log.LogInfo($"[BoatMod] wheel: no name match, using first axis device '{fallback.displayName}' (type '{fallback.GetType().Name}', layout '{fallback.layout}')");
-                return fallback;
+
+                var chosen = named ?? (match.Length > 0 ? fallback : (auto ?? fallback));
+                if (chosen != null)
+                {
+                    string how = chosen == named ? $"DeviceName='{match}'" : chosen == auto ? "auto name match" : "first axis device fallback";
+                    Log.LogInfo($"[BoatMod] wheel: device '{chosen.displayName}' (type '{chosen.GetType().Name}', layout '{chosen.layout}') via {how}");
+                }
+                return chosen;
             }
             catch (Exception e)
             {
@@ -1126,7 +1425,7 @@ namespace BoatMod
         private static void StartCapture()
         {
             _captureSamples = 0;
-            _restThrottle = _restBrake = 0f;
+            _restThrottle = _restBrake = _restSteer = 0f;
             _captureUntil = Time.unscaledTime + 1f;
         }
 
@@ -1138,6 +1437,7 @@ namespace BoatMod
                 {
                     _restThrottle /= _captureSamples;
                     _restBrake /= _captureSamples;
+                    _restSteer /= _captureSamples;
                 }
                 _captured = true;
                 _throttleRange = _brakeRange = 0.3f;
@@ -1146,13 +1446,22 @@ namespace BoatMod
                 else if (_calSteerSaved.Value)
                     Log.LogInfo($"[BoatMod] wheel: using session steering calibration center={_calSteerCenter.Value:F3} left={_calSteerLeft.Value:F3} right={_calSteerRight.Value:F3} (press {_calKey.Value} to recalibrate)");
                 else
-                    Log.LogInfo($"[BoatMod] wheel: no saved steering calibration - run wizard once (press {_calKey.Value}; after two lock captures it persists across restarts). pedals rest t={_restThrottle:F2} b={_restBrake:F2}");
+                    Log.LogInfo($"[BoatMod] wheel: no saved steering calibration - using automatic centre/range mapping (steer {(_steer != null ? _steer.path : "?")}, rest {_restSteer:F3}); press {_calKey.Value} to calibrate full lock-to-lock. pedals rest t={_restThrottle:F2} b={_restBrake:F2}");
+                StartCaptureProbeAfterRest();
                 return;
             }
-            if (_throttle == null && _brake == null) return;
+            if (_steer == null && _throttle == null && _brake == null) return;
+            _restSteer += _steer != null ? _steer.ReadUnprocessedValue() : 0f;
             _restThrottle += _throttle != null ? _throttle.ReadValue() : 0f;
             _restBrake += _brake != null ? _brake.ReadValue() : 0f;
             _captureSamples++;
+        }
+
+        private static void StartCaptureProbeAfterRest()
+        {
+            // Re-arm the probe with the post-capture control set; if the wheel was
+            // moved during the 1s rest capture we may already have a better axis.
+            BeginSteerProbe();
         }
 
         private static float Remap(float value, float rest, ref float range, bool symmetric)
@@ -1223,6 +1532,7 @@ namespace BoatMod
             _calSteerRawLeft = cfg.Bind("Wheel", "SteerRawLeft", 0f, "Internal: LEFT lock on the hardware angle circle (persists across restarts)");
             _calSteerRawSpan = cfg.Bind("Wheel", "SteerRawSpan", 0f, "Internal: lock-to-lock distance in unwrapped units (~2.0 for a 900 degree wheel)");
             _calSteerTurnSign = cfg.Bind("Wheel", "SteerTurnSign", 1f, "Internal: +1 if turning right increases the raw axis, -1 otherwise");
+            _calSteerDevice = cfg.Bind("Wheel", "SteerCalDevice", "", "Internal: device/layout/axis fingerprint the saved steering calibration belongs to");
         }
 
         private static Type FindType(string simpleName)
@@ -1251,7 +1561,11 @@ namespace BoatMod
                 return $"cal: center {_calSteerCenter.Value:F3}  L {_calSteerLeft.Value:F3}  R {_calSteerRight.Value:F3}";
             if (PersistentCalUsable())
                 return $"PERSISTENT cal active (restarts OK): left@{WrapCircle(_calSteerRawLeft.Value):F3} span {_calSteerRawSpan.Value:F2} (wizard not needed; {_calKey?.Value ?? "K"} to retake)";
-            return "not calibrated - press " + (_calKey?.Value ?? "K") + " to run the wizard once (saved calibration then survives restarts)";
+            if (_calSteerSaved.Value && !_calDeviceMatches)
+                return "saved calibration ignored (different device/axis) - using automatic mapping; press " + (_calKey?.Value ?? "K") + " to calibrate";
+            if (_calSteerSaved.Value)
+                return "saved calibration unusable - using automatic mapping; press " + (_calKey?.Value ?? "K") + " to calibrate";
+            return "automatic centre/range mapping active - press " + (_calKey?.Value ?? "K") + " to calibrate full lock-to-lock";
         }
 
         private static string CalStepText()
@@ -1286,6 +1600,7 @@ namespace BoatMod
             else
             {
                 lines.Add($"out: steer {_outSteer:F2}  pedal {_outPedal:F2}  inject={(_injectOn ? "on" : "off")}  direct={(_directRudder != null && _directRudder.Value ? "on" : "off")}");
+                lines.Add($"axis: {(_steer != null ? _steer.path : "(none - turn the wheel to auto-detect)")}");
                 if (_device != null && _steer != null && _throttle != null && _brake != null)
                     lines.Add($"raw: r {_steer.ReadValue():F3} (u {_steer.ReadUnprocessedValue():F3})  w {_unwrappedSteer:F3}  t {_throttle.ReadValue():F3}  b {_brake.ReadValue():F3}");
                 if (_diag != null && _diag.Value)
