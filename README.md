@@ -21,6 +21,8 @@ one-time steering calibration that survives restarts.
 - Per-model scale, offsets and yaw, live-configurable.
 - Hides the original hull and native attachment renderers.
 - Works in both the shop preview and races.
+- Keeps the game's stock boat physics (the experimental 3-DOF Fossen handling
+  from v1.8.0 is not included).
 
 ## Requirements
 

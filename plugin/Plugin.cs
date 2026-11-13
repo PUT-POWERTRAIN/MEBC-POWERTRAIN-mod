@@ -197,14 +197,6 @@ namespace BoatMod
             {
                 Log.LogWarning($"[BoatMod] wheel init failed: {e.Message}");
             }
-            try
-            {
-                FossenPhysics.BindAndInit(Config, new Harmony(PluginGuid));
-            }
-            catch (Exception e)
-            {
-                Log.LogWarning($"[BoatMod] fossen init failed: {e.Message}");
-            }
             Log.LogInfo("[BoatMod] loaded, scanner running on plugin component");
         }
 
@@ -288,14 +280,6 @@ namespace BoatMod
             catch (Exception e)
             {
                 Log.LogWarning($"[BoatMod] wheel tick failed: {e.Message}");
-            }
-            try
-            {
-                FossenPhysics.Tick();
-            }
-            catch (Exception e)
-            {
-                Log.LogWarning($"[BoatMod] fossen tick failed: {e.Message}");
             }
             if (_groups == null || !_enabled.Value) return;
             _timer -= Time.unscaledDeltaTime;
